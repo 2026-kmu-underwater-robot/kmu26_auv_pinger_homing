@@ -24,8 +24,13 @@ def test_alt_hold_and_private_rc_defaults():
 def test_frequency_selection_contract():
     selector = (ROOT / "src" / "pinger_frequency_selector.cpp").read_text()
     assert "monitor_s_" in selector
-    assert "values.size() > 5U" in selector
-    assert "frequency candidates" in selector
+    assert "Eigen::FFT<double>" in selector
+    assert "FFT scan" in selector
+    assert "min_snr_db_" in selector
+    assert "min_peak_prominence_db_" in selector
+    assert "minimum_candidate_hits_" in selector
+    assert "average_power_" in selector
+    assert "spectral_peaks" in selector
     assert '"/pinger_homing/manual_selection"' in selector
 
 
@@ -50,3 +55,12 @@ def test_xy_only_controller():
     assert "update_direction_from_feedback(false)" in text
     assert "approach_dither_command_" in text
     assert '\\"feedback_updates\\"' in text
+
+
+if __name__ == "__main__":
+    # CTest invokes this file directly rather than through pytest.
+    test_standalone_package_has_no_hydrophone_repos_dependency()
+    test_alt_hold_and_private_rc_defaults()
+    test_frequency_selection_contract()
+    test_manual_selection_wrapper_waits_for_ros_discovery()
+    test_xy_only_controller()

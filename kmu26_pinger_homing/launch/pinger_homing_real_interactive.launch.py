@@ -191,10 +191,14 @@ def _start_real_homing_after_selection(context, *args, **kwargs):
         try:
             ranked = json.loads(candidates[-1]).get("candidates", [])
             for index, candidate in enumerate(ranked, start=1):
+                snr_db = float(candidate.get("snr_db", candidate["score"]))
+                prominence_db = float(candidate.get("prominence_db", 0.0))
+                quality = "qualified" if bool(candidate.get("qualified", True)) else "manual-only"
                 print(
                     "[pinger] "
                     f"[{index}] {float(candidate['frequency_hz']):.1f} Hz "
-                    f"(hits={int(candidate['hits'])}, score={float(candidate['score']):.6g})"
+                    f"(hits={int(candidate['hits'])}, SNR={snr_db:.1f} dB, "
+                    f"prominence={prominence_db:.1f} dB, {quality})"
                 )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             print("[pinger] frequency scan complete; enter a candidate number or exact Hz.")
@@ -302,6 +306,30 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("candidate_topic", default_value="/pinger_homing/frequency_candidates"),
         DeclareLaunchArgument("manual_selection_topic", default_value="/pinger_homing/manual_selection"),
         DeclareLaunchArgument("scan_monitor_s", default_value="5.0"),
+        DeclareLaunchArgument(
+            "scan_fft_size", default_value="8192",
+            description="FFT length for the frequency scan (96000/8192 = 11.72 Hz bins).",
+        ),
+        DeclareLaunchArgument(
+            "scan_fft_hop_size", default_value="4096",
+            description="FFT scan hop; 4096 gives 50% overlap.",
+        ),
+        DeclareLaunchArgument(
+            "scan_min_snr_db", default_value="9.0",
+            description="Minimum median-noise-floor SNR for an auto-selectable candidate.",
+        ),
+        DeclareLaunchArgument(
+            "scan_min_peak_prominence_db", default_value="4.5",
+            description="Minimum local spectral-peak prominence for a qualified candidate.",
+        ),
+        DeclareLaunchArgument(
+            "scan_minimum_candidate_hits", default_value="4",
+            description="Minimum independently repeated FFT windows for a qualified candidate.",
+        ),
+        DeclareLaunchArgument(
+            "scan_candidate_separation_hz", default_value="75.0",
+            description="Do not list sidelobes within this distance of a stronger peak.",
+        ),
         DeclareLaunchArgument("selection_timeout_s", default_value="90.0"),
         DeclareLaunchArgument(
             "gui_rc_handoff",
@@ -341,6 +369,18 @@ def generate_launch_description() -> LaunchDescription:
             "channels": ParameterValue(LaunchConfiguration("audio_channels"), value_type=int),
             "sample_rate": ParameterValue(LaunchConfiguration("audio_sample_rate"), value_type=int),
             "monitor_s": ParameterValue(LaunchConfiguration("scan_monitor_s"), value_type=float),
+            "fft_size": ParameterValue(LaunchConfiguration("scan_fft_size"), value_type=int),
+            "fft_hop_size": ParameterValue(LaunchConfiguration("scan_fft_hop_size"), value_type=int),
+            "min_snr_db": ParameterValue(LaunchConfiguration("scan_min_snr_db"), value_type=float),
+            "min_peak_prominence_db": ParameterValue(
+                LaunchConfiguration("scan_min_peak_prominence_db"), value_type=float
+            ),
+            "minimum_candidate_hits": ParameterValue(
+                LaunchConfiguration("scan_minimum_candidate_hits"), value_type=int
+            ),
+            "candidate_separation_hz": ParameterValue(
+                LaunchConfiguration("scan_candidate_separation_hz"), value_type=float
+            ),
             "auto_select_top": False,
             "selected_frequency_topic": LaunchConfiguration("selected_frequency_topic"),
             "candidate_topic": LaunchConfiguration("candidate_topic"),

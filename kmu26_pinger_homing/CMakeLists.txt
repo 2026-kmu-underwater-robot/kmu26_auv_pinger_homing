@@ -21,6 +21,7 @@ ament_target_dependencies(pinger_audio_estimator audio_common_msgs rclcpp std_ms
 
 add_executable(pinger_frequency_selector src/pinger_frequency_selector.cpp)
 ament_target_dependencies(pinger_frequency_selector audio_common_msgs rclcpp std_msgs)
+target_link_libraries(pinger_frequency_selector Eigen3::Eigen)
 
 add_executable(pinger_homing_2d_controller src/pinger_homing_2d_controller.cpp)
 ament_target_dependencies(pinger_homing_2d_controller geometry_msgs mavros_msgs nav_msgs rclcpp sensor_msgs std_msgs)

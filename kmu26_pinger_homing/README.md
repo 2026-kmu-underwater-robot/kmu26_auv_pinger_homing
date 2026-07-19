@@ -70,9 +70,15 @@ ros2 run kmu26_pinger_homing start_pinger_homing_test_tank.sh \
 ```
 
 이 wrapper는 5초 감시가 끝난 뒤 같은 터미널에서 후보 번호 또는 Hz를 받는다.
-후보는 100 Hz coarse scan 뒤 마지막 PCM window에서 2 Hz 간격으로 정밀 탐색되어,
-예를 들어 21164 Hz 수조 송신기를 21200 Hz로 잘못 고르는 일을 막는다. 선택 결과는
-현재 실행에만 유효하며 이전 DDS 실행의 주파수 선택을 재사용하지 않는다.
+후보는 기존 `kmu26_auv_hydrophone` FFT 노드의 계약을 따라, 8192-sample Hann FFT
+(96 kHz 입력이면 **11.72 Hz/bin**), 50% overlap, 5초 Welch 평균 스펙트럼, band median
+noise-floor SNR, local peak prominence, 그리고 반복 검출 횟수로 판정한다. 따라서 한
+프레임 노이즈나 강한 side-lobe는 후보가 되지 않고, 수조 송신기 21164 Hz도 FFT peak
+interpolation으로 100 Hz 단위로 반올림하지 않는다. 기본 품질 기준은 `SNR >= 9 dB`,
+prominence `>= 4.5 dB`, 반복 FFT window `>= 4`회다. `scan_fft_size`,
+`scan_min_snr_db`, `scan_min_peak_prominence_db`, `scan_minimum_candidate_hits` launch
+파라미터로 수조/실물 잡음 환경에 맞출 수 있다. 선택 결과는 현재 실행에만 유효하며
+이전 DDS 실행의 주파수 선택을 재사용하지 않는다.
 `ros2 launch`에 직접 입력한 표준입력은 ROS launch 자식 노드로 전달되지 않으므로,
 수동 선택에는 위 wrapper를 사용한다. SNR 모드는
 `estimator_mode:=snr`로 선택한다. test-tank에서 최종 RC까지 연결할 때만

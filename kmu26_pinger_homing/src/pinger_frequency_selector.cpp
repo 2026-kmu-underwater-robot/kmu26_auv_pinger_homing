@@ -7,8 +7,10 @@
 #include <deque>
 #include <iostream>
 #include <map>
+#include <numeric>
 #include <poll.h>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -17,9 +19,16 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <unsupported/Eigen/FFT>
 
 namespace kmu26_pinger_homing {
 
+// This is a selector, not the Phase estimator.  It deliberately shares the
+// proven FFT detection contract from kmu26_auv_hydrophone: DC removal, Hann
+// windowing, a band-limited median noise floor, an SNR gate, and repeated
+// windows.  The old selector evaluated only 100-Hz Goertzel-like probes and
+// refined a candidate from the final PCM frame, which made a short noise burst
+// look just as credible as a pinger.
 class FingerFrequencySelector final : public rclcpp::Node {
  public:
   FingerFrequencySelector() : Node("pinger_frequency_selector") {
@@ -30,27 +39,49 @@ class FingerFrequencySelector final : public rclcpp::Node {
         "candidate_topic", "/pinger_homing/frequency_candidates");
     manual_selection_topic_ = declare_parameter<std::string>(
         "manual_selection_topic", "/pinger_homing/manual_selection");
-    sample_rate_ = declare_parameter<int>("sample_rate", 96000);
+    sample_rate_ = std::max(
+        8000, static_cast<int>(declare_parameter<int>("sample_rate", 96000)));
     channels_ = std::max(1, static_cast<int>(declare_parameter<int>("channels", 2)));
-    channel_index_ = std::clamp(static_cast<int>(declare_parameter<int>("channel_index", 0)), 0, channels_ - 1);
+    channel_index_ = std::clamp(
+        static_cast<int>(declare_parameter<int>("channel_index", 0)), 0, channels_ - 1);
     monitor_s_ = std::clamp(declare_parameter<double>("monitor_s", 5.0), 1.0, 30.0);
     min_frequency_ = declare_parameter<double>("min_frequency_hz", 15000.0);
     max_frequency_ = declare_parameter<double>("max_frequency_hz", 25000.0);
-    frequency_step_ = std::clamp(declare_parameter<double>("frequency_step_hz", 100.0), 25.0, 500.0);
-    fine_frequency_step_ = std::clamp(
-        declare_parameter<double>("fine_frequency_step_hz", 2.0), 0.25, 10.0);
-    fine_half_width_ = std::clamp(
-        declare_parameter<double>("fine_half_width_hz", 75.0), 10.0, 250.0);
-    window_size_ = std::clamp(static_cast<int>(declare_parameter<int>("window_size", 4096)), 512, 16384);
-    hop_size_ = std::clamp(static_cast<int>(declare_parameter<int>("hop_size", 4096)), 512, window_size_);
+    if (max_frequency_ <= min_frequency_) {
+      throw std::runtime_error("max_frequency_hz must be greater than min_frequency_hz");
+    }
+
+    // window_size/hop_size remain supported for old launch files.  New names
+    // make their FFT role explicit and default to 11.72-Hz bins at 96 kHz.
+    const int legacy_window_size = static_cast<int>(declare_parameter<int>("window_size", 0));
+    const int legacy_hop_size = static_cast<int>(declare_parameter<int>("hop_size", 0));
+    const int fft_default = legacy_window_size > 0 ? legacy_window_size : 8192;
+    fft_size_ = std::clamp(
+        static_cast<int>(declare_parameter<int>("fft_size", fft_default)), 1024, 32768);
+    const int hop_default = legacy_hop_size > 0 ? legacy_hop_size : fft_size_ / 2;
+    fft_hop_size_ = std::clamp(
+        static_cast<int>(declare_parameter<int>("fft_hop_size", hop_default)), 256, fft_size_);
+
+    min_snr_db_ = std::clamp(declare_parameter<double>("min_snr_db", 9.0), 0.0, 80.0);
+    min_peak_prominence_db_ = std::clamp(
+        declare_parameter<double>("min_peak_prominence_db", 4.5), 0.0, 80.0);
+    minimum_candidate_hits_ = std::max(
+        1, static_cast<int>(declare_parameter<int>("minimum_candidate_hits", 4)));
+    candidate_cluster_hz_ = std::clamp(
+        declare_parameter<double>("candidate_cluster_hz", 25.0), 1.0, 500.0);
+    candidate_separation_hz_ = std::clamp(
+        declare_parameter<double>("candidate_separation_hz", 75.0), 1.0, 2000.0);
+    max_candidates_ = std::clamp(
+        static_cast<int>(declare_parameter<int>("max_candidates", 5)), 1, 10);
+    blacklist_frequency_hz_ = declare_parameter<double>("blacklist_frequency_hz", 0.0);
+    blacklist_half_width_hz_ = std::max(
+        0.0, declare_parameter<double>("blacklist_half_width_hz", 0.0));
     auto_select_top_ = declare_parameter<bool>("auto_select_top", false);
     stdin_selection_enabled_ = declare_parameter<bool>("stdin_selection_enabled", true);
-    // A frequency choice is valid only for this five-second scan.  Do not
-    // latch it: a new test-tank launch must never start probing from the
-    // previous run's DDS history and then have its Phase accumulator reset
-    // underneath an active ABBA leg.
-    selected_pub_ = create_publisher<std_msgs::msg::Float64>(
-        selected_topic_, rclcpp::QoS(1));
+
+    // A choice is volatile by design. A later test-tank launch must not obtain
+    // an old DDS selection while its Phase accumulator is starting afresh.
+    selected_pub_ = create_publisher<std_msgs::msg::Float64>(selected_topic_, rclcpp::QoS(1));
     candidate_pub_ = create_publisher<std_msgs::msg::String>(
         candidate_topic_, rclcpp::QoS(1).transient_local());
     audio_sub_ = create_subscription<audio_common_msgs::msg::AudioData>(
@@ -60,14 +91,38 @@ class FingerFrequencySelector final : public rclcpp::Node {
         manual_selection_topic_, 10,
         [this](const std_msgs::msg::String::SharedPtr msg) { select_from_text(msg->data); });
     timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() { poll_selection(); });
-    started_ = std::chrono::steady_clock::now();
-    RCLCPP_INFO(get_logger(), "monitoring %.0f--%.0f Hz for %.1f seconds",
-                min_frequency_, max_frequency_, monitor_s_);
+    started_ = Clock::now();
+    RCLCPP_INFO(
+        get_logger(),
+        "FFT scan %.0f--%.0f Hz for %.1fs: N=%d, bin=%.3f Hz, hop=%d, min SNR=%.1f dB",
+        min_frequency_, max_frequency_, monitor_s_, fft_size_, frequency_resolution_hz(),
+        fft_hop_size_, min_snr_db_);
   }
 
  private:
   using Clock = std::chrono::steady_clock;
-  struct Candidate { double frequency{0.0}; double magnitude{0.0}; int hits{0}; };
+
+  struct WindowPeak {
+    double frequency{0.0};
+    double power{0.0};
+    double snr_db{0.0};
+    double prominence_db{0.0};
+  };
+
+  struct AccumulatedCandidate {
+    double weighted_frequency_sum{0.0};
+    double weight_sum{0.0};
+    double snr_sum{0.0};
+    int hits{0};
+  };
+
+  struct Candidate {
+    double frequency{0.0};
+    double score{0.0};  // average-spectrum SNR in dB
+    double prominence_db{0.0};
+    int hits{0};
+    bool qualified{false};
+  };
 
   static int32_t read_s32(const std::vector<uint8_t> &data, std::size_t i) {
     const uint32_t value = static_cast<uint32_t>(data[i]) |
@@ -77,16 +132,99 @@ class FingerFrequencySelector final : public rclcpp::Node {
     return static_cast<int32_t>(value);
   }
 
-  double magnitude(const std::vector<double> &window, double frequency) const {
-    std::complex<double> sum(0.0, 0.0);
-    const double step = 2.0 * M_PI * frequency / static_cast<double>(sample_rate_);
-    const double denom = static_cast<double>(std::max(1, window_size_ - 1));
-    for (std::size_t n = 0; n < window.size(); ++n) {
-      const double w = 0.5 * (1.0 - std::cos(2.0 * M_PI * n / denom));
-      const double phase = step * static_cast<double>(sample_cursor_ + n);
-      sum += w * window[n] * std::complex<double>(std::cos(phase), -std::sin(phase));
+  static double median(std::vector<double> values) {
+    if (values.empty()) return 0.0;
+    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2U);
+    std::nth_element(values.begin(), middle, values.end());
+    return *middle;
+  }
+
+  double frequency_resolution_hz() const {
+    return static_cast<double>(sample_rate_) / static_cast<double>(fft_size_);
+  }
+
+  bool blacklisted(double frequency) const {
+    return blacklist_half_width_hz_ > 0.0 &&
+        std::abs(frequency - blacklist_frequency_hz_) <= blacklist_half_width_hz_;
+  }
+
+  std::pair<std::size_t, std::size_t> band_limits(const std::size_t nyquist_bin) const {
+    const double resolution = frequency_resolution_hz();
+    const auto min_bin = std::max<std::size_t>(
+        1U, static_cast<std::size_t>(std::ceil(min_frequency_ / resolution)));
+    const auto max_bin = std::min<std::size_t>(
+        nyquist_bin - 1U, static_cast<std::size_t>(std::floor(max_frequency_ / resolution)));
+    return {min_bin, max_bin};
+  }
+
+  WindowPeak make_peak(
+      const std::vector<double> &power, std::size_t bin, std::size_t min_bin,
+      std::size_t max_bin, double noise_floor) const {
+    const double center = power[bin];
+    const double left = power[bin - 1U];
+    const double right = power[bin + 1U];
+    const double denominator = left - 2.0 * center + right;
+    double fractional_bin = 0.0;
+    if (std::abs(denominator) > 1.0e-30) {
+      fractional_bin = std::clamp(0.5 * (left - right) / denominator, -0.5, 0.5);
     }
-    return std::abs(sum) / static_cast<double>(window.size());
+
+    // The surrounding median deliberately skips the centre bin.  It rejects
+    // a broad tonal shoulder that is high relative to the band but not a
+    // distinct spectral peak.
+    std::vector<double> local;
+    constexpr std::size_t kLocalRadius = 8U;
+    const auto local_low = std::max(min_bin, bin > kLocalRadius ? bin - kLocalRadius : min_bin);
+    const auto local_high = std::min(max_bin, bin + kLocalRadius);
+    local.reserve(local_high - local_low);
+    for (std::size_t index = local_low; index <= local_high; ++index) {
+      if (index != bin) local.push_back(power[index]);
+    }
+    const double local_floor = std::max(1.0e-24, median(std::move(local)));
+    constexpr double kEpsilon = 1.0e-24;
+    return WindowPeak{
+        (static_cast<double>(bin) + fractional_bin) * frequency_resolution_hz(),
+        center,
+        10.0 * std::log10((center + kEpsilon) / (noise_floor + kEpsilon)),
+        10.0 * std::log10((center + kEpsilon) / (local_floor + kEpsilon))};
+  }
+
+  std::vector<WindowPeak> spectral_peaks(
+      const std::vector<double> &power, bool require_quality) const {
+    if (power.size() < 3U) return {};
+    const auto [min_bin, max_bin] = band_limits(power.size() - 1U);
+    if (min_bin + 2U >= max_bin) return {};
+
+    std::vector<double> band_power;
+    band_power.reserve(max_bin - min_bin + 1U);
+    for (std::size_t bin = min_bin; bin <= max_bin; ++bin) {
+      band_power.push_back(power[bin]);
+    }
+    const double noise_floor = std::max(1.0e-24, median(std::move(band_power)));
+    std::vector<WindowPeak> found;
+    for (std::size_t bin = min_bin + 1U; bin < max_bin; ++bin) {
+      if (power[bin] < power[bin - 1U] || power[bin] < power[bin + 1U]) continue;
+      const auto peak = make_peak(power, bin, min_bin, max_bin, noise_floor);
+      if (blacklisted(peak.frequency)) continue;
+      if (require_quality &&
+          (peak.snr_db < min_snr_db_ || peak.prominence_db < min_peak_prominence_db_)) {
+        continue;
+      }
+      found.push_back(peak);
+    }
+    std::sort(found.begin(), found.end(), [](const WindowPeak &a, const WindowPeak &b) {
+      return a.snr_db > b.snr_db;
+    });
+    std::vector<WindowPeak> separated;
+    separated.reserve(found.size());
+    for (const auto &peak : found) {
+      const bool close_to_better_peak = std::any_of(
+          separated.begin(), separated.end(), [this, &peak](const WindowPeak &accepted) {
+            return std::abs(accepted.frequency - peak.frequency) < candidate_separation_hz_;
+          });
+      if (!close_to_better_peak) separated.push_back(peak);
+    }
+    return separated;
   }
 
   void on_audio(const audio_common_msgs::msg::AudioData &msg) {
@@ -95,106 +233,137 @@ class FingerFrequencySelector final : public rclcpp::Node {
       const std::size_t offset = frame + static_cast<std::size_t>(channel_index_) * 4U;
       samples_.push_back(static_cast<double>(read_s32(msg.data, offset)) / 2147483648.0);
     }
-    while (samples_.size() >= static_cast<std::size_t>(window_size_) &&
-           !monitor_finished_) {
-      const std::vector<double> window(samples_.begin(),
-                                       samples_.begin() + static_cast<std::ptrdiff_t>(window_size_));
-      analyze(window);
-      const std::size_t remove = std::min<std::size_t>(hop_size_, samples_.size());
+    while (!monitor_finished_ && samples_.size() >= static_cast<std::size_t>(fft_size_)) {
+      std::vector<double> window(
+          samples_.begin(), samples_.begin() + static_cast<std::ptrdiff_t>(fft_size_));
+      analyze(std::move(window));
+      const std::size_t remove = std::min<std::size_t>(fft_hop_size_, samples_.size());
       samples_.erase(samples_.begin(), samples_.begin() + static_cast<std::ptrdiff_t>(remove));
-      sample_cursor_ += remove;
     }
   }
 
-  void analyze(const std::vector<double> &window) {
-    // Coarse monitoring is intentionally inexpensive. Keep one recent raw
-    // window so the final candidate can be refined without changing the
-    // five-second operator workflow or the upstream audio contract.
-    last_window_ = window;
-    double best_frequency = min_frequency_;
-    double best_magnitude = -1.0;
-    for (double f = min_frequency_; f <= max_frequency_ + 0.5 * frequency_step_; f += frequency_step_) {
-      const double value = magnitude(window, f);
-      if (value > best_magnitude) { best_magnitude = value; best_frequency = f; }
+  void analyze(std::vector<double> window) {
+    const double mean = std::accumulate(window.begin(), window.end(), 0.0) /
+        static_cast<double>(window.size());
+    const double denominator = static_cast<double>(std::max(1, fft_size_ - 1));
+    for (std::size_t index = 0; index < window.size(); ++index) {
+      const double hann = 0.5 * (1.0 - std::cos(2.0 * M_PI * static_cast<double>(index) / denominator));
+      window[index] = (window[index] - mean) * hann;
     }
-    const double key = std::round(best_frequency / frequency_step_) * frequency_step_;
-    auto &candidate = candidates_[key];
-    candidate.frequency = key;
-    candidate.magnitude += best_magnitude;
-    candidate.hits += 1;
+
+    std::vector<std::complex<double>> bins;
+    fft_.fwd(bins, window);
+    const std::size_t nyquist_bin = bins.size() / 2U;
+    if (average_power_.empty()) average_power_.assign(nyquist_bin + 1U, 0.0);
+    std::vector<double> power(nyquist_bin + 1U, 0.0);
+    for (std::size_t bin = 0; bin <= nyquist_bin; ++bin) {
+      power[bin] = std::norm(bins[bin]);
+      average_power_[bin] += power[bin];
+    }
+    ++fft_windows_;
+
+    // Count independently repeated, qualified window peaks.  The final
+    // ranking uses the entire averaged spectrum; this counter prevents a
+    // single impulse from earning the same confidence as a persistent pinger.
+    for (const auto &peak : spectral_peaks(power, true)) {
+      const double key = std::round(peak.frequency / candidate_cluster_hz_) * candidate_cluster_hz_;
+      auto &candidate = repeated_candidates_[key];
+      const double weight = std::max(1.0, peak.snr_db);
+      candidate.weighted_frequency_sum += peak.frequency * weight;
+      candidate.weight_sum += weight;
+      candidate.snr_sum += peak.snr_db;
+      ++candidate.hits;
+    }
   }
 
-  std::vector<Candidate> ranked() const {
-    std::vector<Candidate> values;
-    for (const auto &entry : candidates_) {
-      if (entry.second.hits >= 2) values.push_back(entry.second);
-    }
-    if (values.empty()) {
-      for (const auto &entry : candidates_) values.push_back(entry.second);
-    }
-    std::sort(values.begin(), values.end(), [](const Candidate &a, const Candidate &b) {
-      if (a.hits != b.hits) return a.hits > b.hits;
-      return a.magnitude > b.magnitude;
-    });
-    if (values.size() > 5U) values.resize(5U);
-    return values;
-  }
-
-  Candidate refine_candidate(Candidate candidate) const {
-    if (last_window_.empty()) return candidate;
-    const double low = std::max(min_frequency_, candidate.frequency - fine_half_width_);
-    const double high = std::min(max_frequency_, candidate.frequency + fine_half_width_);
-    double best_frequency = candidate.frequency;
-    double best_magnitude = -1.0;
-    for (double frequency = low; frequency <= high + 0.5 * fine_frequency_step_;
-         frequency += fine_frequency_step_) {
-      const double value = magnitude(last_window_, frequency);
-      if (value > best_magnitude) {
-        best_magnitude = value;
-        best_frequency = frequency;
+  int repeated_hits_near(double frequency) const {
+    int hits = 0;
+    for (const auto &[key, candidate] : repeated_candidates_) {
+      (void)key;
+      if (candidate.weight_sum > 0.0 &&
+          std::abs(candidate.weighted_frequency_sum / candidate.weight_sum - frequency) <=
+              candidate_cluster_hz_) {
+        hits += candidate.hits;
       }
     }
-    if (best_magnitude >= 0.0) {
-      candidate.frequency = best_frequency;
-      candidate.magnitude = best_magnitude;
-    }
-    return candidate;
+    return hits;
   }
 
-  std::vector<Candidate> refined_ranked() const {
-    auto values = ranked();
-    for (auto &candidate : values) candidate = refine_candidate(candidate);
+  std::vector<Candidate> ranked(bool require_quality) const {
+    if (fft_windows_ == 0U || average_power_.empty()) return {};
+    std::vector<double> averaged = average_power_;
+    for (double &power : averaged) power /= static_cast<double>(fft_windows_);
+
+    std::vector<Candidate> values;
+    for (const auto &peak : spectral_peaks(averaged, require_quality)) {
+      const int hits = repeated_hits_near(peak.frequency);
+      const bool qualified = peak.snr_db >= min_snr_db_ &&
+          peak.prominence_db >= min_peak_prominence_db_ &&
+          hits >= minimum_candidate_hits_;
+      if (require_quality && !qualified) continue;
+      values.push_back(Candidate{peak.frequency, peak.snr_db, peak.prominence_db, hits, qualified});
+    }
+    std::sort(values.begin(), values.end(), [](const Candidate &a, const Candidate &b) {
+      if (a.qualified != b.qualified) return a.qualified;
+      if (a.hits != b.hits) return a.hits > b.hits;
+      return a.score > b.score;
+    });
+    if (values.size() > static_cast<std::size_t>(max_candidates_)) {
+      values.resize(static_cast<std::size_t>(max_candidates_));
+    }
     return values;
   }
 
   void finish_monitor() {
     if (monitor_finished_) return;
     monitor_finished_ = true;
-    const auto values = refined_ranked();
+    final_candidates_ = ranked(true);
+    if (final_candidates_.empty()) {
+      final_candidates_ = ranked(false);
+      RCLCPP_WARN(
+          get_logger(),
+          "no FFT peak met SNR %.1f dB, prominence %.1f dB and %d repeated windows; "
+          "showing unqualified spectrum peaks for manual diagnosis",
+          min_snr_db_, min_peak_prominence_db_, minimum_candidate_hits_);
+    }
+
     std::ostringstream json;
-    json << "{\"ready\":true,\"candidates\":[";
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      if (i) json << ',';
-      json << "{\"frequency_hz\":" << values[i].frequency
-           << ",\"hits\":" << values[i].hits
-           << ",\"score\":" << values[i].magnitude << '}';
+    json << "{\"ready\":true,\"fft_windows\":" << fft_windows_
+         << ",\"frequency_resolution_hz\":" << frequency_resolution_hz()
+         << ",\"candidates\":[";
+    for (std::size_t index = 0; index < final_candidates_.size(); ++index) {
+      if (index) json << ',';
+      const auto &candidate = final_candidates_[index];
+      json << "{\"frequency_hz\":" << candidate.frequency
+           << ",\"hits\":" << candidate.hits
+           << ",\"score\":" << candidate.score
+           << ",\"snr_db\":" << candidate.score
+           << ",\"prominence_db\":" << candidate.prominence_db
+           << ",\"qualified\":" << (candidate.qualified ? "true" : "false") << '}';
     }
     json << "]}";
-    std_msgs::msg::String msg;
-    msg.data = json.str();
-    candidate_pub_->publish(msg);
-    RCLCPP_INFO(get_logger(), "repeated frequency candidates (top %zu):", values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      RCLCPP_INFO(get_logger(), "  [%zu] %.1f Hz (hits=%d score=%.6g)",
-                  i + 1, values[i].frequency, values[i].hits, values[i].magnitude);
+    candidate_pub_->publish(std_msgs::msg::String().set__data(json.str()));
+
+    RCLCPP_INFO(
+        get_logger(), "FFT candidates after %zu windows (%.3f Hz/bin):",
+        fft_windows_, frequency_resolution_hz());
+    for (std::size_t index = 0; index < final_candidates_.size(); ++index) {
+      const auto &candidate = final_candidates_[index];
+      RCLCPP_INFO(
+          get_logger(), "  [%zu] %.2f Hz (hits=%d, SNR=%.1f dB, prominence=%.1f dB, %s)",
+          index + 1U, candidate.frequency, candidate.hits, candidate.score,
+          candidate.prominence_db, candidate.qualified ? "qualified" : "manual-only");
     }
     if (!auto_select_top_ && stdin_selection_enabled_) {
       RCLCPP_INFO(
-          get_logger(),
-          "Enter candidate 1-%zu or an exact frequency in Hz in this terminal.",
-          values.size());
+          get_logger(), "Enter candidate 1-%zu or an exact frequency in Hz in this terminal.",
+          final_candidates_.size());
     }
-    if (auto_select_top_ && !values.empty()) select(values.front().frequency);
+    if (auto_select_top_ && !final_candidates_.empty() && final_candidates_.front().qualified) {
+      select(final_candidates_.front().frequency);
+    } else if (auto_select_top_ && !final_candidates_.empty()) {
+      RCLCPP_WARN(get_logger(), "auto-select withheld because the strongest FFT peak is not qualified");
+    }
   }
 
   void select(double frequency) {
@@ -203,31 +372,29 @@ class FingerFrequencySelector final : public rclcpp::Node {
       RCLCPP_WARN(get_logger(), "selection %.2f Hz is outside monitored band", frequency);
       return;
     }
-    std_msgs::msg::Float64 msg;
-    msg.data = frequency;
-    selected_pub_->publish(msg);
+    selected_pub_->publish(std_msgs::msg::Float64().set__data(frequency));
     selected_ = true;
-    RCLCPP_INFO(get_logger(), "frequency %.1f Hz selected; homing controller may start", frequency);
+    RCLCPP_INFO(get_logger(), "frequency %.2f Hz selected; homing controller may start", frequency);
   }
 
   void select_from_text(const std::string &text) {
     if (!monitor_finished_ || selected_) return;
-    const auto values = refined_ranked();
     try {
       const double value = std::stod(text);
-      if (value >= 1.0 && value <= static_cast<double>(values.size()) &&
+      if (value >= 1.0 && value <= static_cast<double>(final_candidates_.size()) &&
           std::floor(value) == value) {
-        select(values[static_cast<std::size_t>(value) - 1U].frequency);
+        select(final_candidates_[static_cast<std::size_t>(value) - 1U].frequency);
       } else {
         select(value);
       }
     } catch (...) {
-      RCLCPP_WARN(get_logger(), "enter candidate number 1-%zu or frequency in Hz", values.size());
+      RCLCPP_WARN(get_logger(), "enter candidate number 1-%zu or frequency in Hz", final_candidates_.size());
     }
   }
 
   void poll_selection() {
-    if (!monitor_finished_ && std::chrono::duration<double>(Clock::now() - started_).count() >= monitor_s_) {
+    if (!monitor_finished_ &&
+        std::chrono::duration<double>(Clock::now() - started_).count() >= monitor_s_) {
       finish_monitor();
     }
     if (!monitor_finished_ || selected_ || auto_select_top_ || !stdin_selection_enabled_) return;
@@ -235,19 +402,23 @@ class FingerFrequencySelector final : public rclcpp::Node {
     if (::poll(&descriptor, 1, 0) <= 0) return;
     std::string line;
     std::getline(std::cin, line);
-    if (line.empty()) return;
-    select_from_text(line);
+    if (!line.empty()) select_from_text(line);
   }
 
   std::string audio_topic_, selected_topic_, candidate_topic_, manual_selection_topic_;
-  int sample_rate_{96000}, channels_{2}, channel_index_{0}, window_size_{4096}, hop_size_{4096};
-  double monitor_s_{5.0}, min_frequency_{15000.0}, max_frequency_{25000.0}, frequency_step_{100.0};
-  double fine_frequency_step_{2.0}, fine_half_width_{75.0};
+  int sample_rate_{96000}, channels_{2}, channel_index_{0}, fft_size_{8192}, fft_hop_size_{4096};
+  double monitor_s_{5.0}, min_frequency_{15000.0}, max_frequency_{25000.0};
+  double min_snr_db_{9.0}, min_peak_prominence_db_{4.5};
+  int minimum_candidate_hits_{4}, max_candidates_{5};
+  double candidate_cluster_hz_{25.0}, candidate_separation_hz_{75.0};
+  double blacklist_frequency_hz_{0.0}, blacklist_half_width_hz_{0.0};
   bool auto_select_top_{false}, stdin_selection_enabled_{true}, monitor_finished_{false}, selected_{false};
-  std::uint64_t sample_cursor_{0};
   std::deque<double> samples_;
-  std::vector<double> last_window_;
-  std::map<double, Candidate> candidates_;
+  std::vector<double> average_power_;
+  std::map<double, AccumulatedCandidate> repeated_candidates_;
+  std::vector<Candidate> final_candidates_;
+  std::size_t fft_windows_{0U};
+  Eigen::FFT<double> fft_;
   Clock::time_point started_;
   rclcpp::Subscription<audio_common_msgs::msg::AudioData>::SharedPtr audio_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr manual_selection_sub_;
