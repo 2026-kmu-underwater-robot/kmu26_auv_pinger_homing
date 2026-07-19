@@ -86,6 +86,9 @@ prominence `>= 4.5 dB`, 반복 FFT window `>= 4`회다. `scan_fft_size`,
 `estimator_mode:=snr`로 선택한다. test-tank에서 최종 RC까지 연결할 때만
 `rc_output_topic:=/mavros/rc/override`를 명시한다.
 
-수조에서 검증된 기본 PWM은 probe `±90`, 접근 `+120` (중립 1500, span 400)이며,
+`pinger_homing_test_tank.launch.py`의 기본 Phase 프로파일은 probe `±90`, 접근 `+120`
+(중립 1500, span 400), leg `1.25 s`, neutral `0.35 s`, settle `0.55 s`, sample delay
+`0.40 s`, 초기 확인 2회, 접근/reprobe `3.0 s`, RC loop `30 Hz`다. 이 값은 빠른
+0.4초 probe가 controller의 0.5초 하한으로 잘리고 안정 구간을 잃는 문제를 피한다.
 `probe_pwm_delta:=`와 `approach_pwm_delta:=`로 바꿀 수 있다. 실물의 초기 시험은
 반드시 낮은 PWM(예: ±15--25), `dry_run:=true`, 그리고 프로펠러 제거 상태에서 시작한다.

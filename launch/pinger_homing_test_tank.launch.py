@@ -34,12 +34,16 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("rc_pwm_span", default_value="400.0"),
         DeclareLaunchArgument("probe_pwm_delta", default_value="90"),
         DeclareLaunchArgument("approach_pwm_delta", default_value="120"),
-        DeclareLaunchArgument("probe_leg_s", default_value="0.65"),
-        DeclareLaunchArgument("probe_neutral_s", default_value="0.20"),
-        DeclareLaunchArgument("probe_settle_s", default_value="0.45"),
-        DeclareLaunchArgument("probe_sample_delay_s", default_value="0.22"),
-        DeclareLaunchArgument("approach_duration_s", default_value="2.2"),
-        DeclareLaunchArgument("initial_confirmation_probes", default_value="1"),
+        # Balanced test-tank Phase profile.  A 0.4 s request is clamped by
+        # the controller to 0.5 s and leaves too little post-spool-up signal
+        # for the ABBA/Huber fit.  These values preserve a 0.85 s clean leg
+        # while keeping each feedback/reprobe cycle short.
+        DeclareLaunchArgument("probe_leg_s", default_value="1.25"),
+        DeclareLaunchArgument("probe_neutral_s", default_value="0.35"),
+        DeclareLaunchArgument("probe_settle_s", default_value="0.55"),
+        DeclareLaunchArgument("probe_sample_delay_s", default_value="0.40"),
+        DeclareLaunchArgument("approach_duration_s", default_value="3.0"),
+        DeclareLaunchArgument("initial_confirmation_probes", default_value="2"),
         Node(
             package="kmu26_pinger_homing",
             executable="pinger_frequency_selector",
@@ -90,7 +94,7 @@ def generate_launch_description() -> LaunchDescription:
                 "control_direction_output_topic": "/pinger_homing/control_direction_body",
                 "status_topic": "/pinger_homing/status",
                 "rc_output_topic": LaunchConfiguration("rc_output_topic"),
-                "rate_hz": 40.0,
+                "rate_hz": 30.0,
                 # Test-tank profile: ALT_HOLD owns Z; no map/ground-truth or
                 # /odometry/filtered input participates in the Phase fit.
                 "tank_max_depth_m": 0.0,
