@@ -63,6 +63,8 @@ class FingerHomingController final : public rclcpp::Node {
         "/pinger_homing/direction", 10);
     gui_direction_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
         "/homing/direction", 10);
+    viewer_direction_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
+        "/pinger_homing/direction_body", 10);
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         odom_topic_, rclcpp::SensorDataQoS(),
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) { on_odom(*msg); });
@@ -322,6 +324,7 @@ class FingerHomingController final : public rclcpp::Node {
                                std::cos(yaw_) * direction_world_->y();
       gui_direction.vector.z = 0.0;
       gui_direction_pub_->publish(gui_direction);
+      viewer_direction_pub_->publish(gui_direction);
     }
   }
 
@@ -346,6 +349,7 @@ class FingerHomingController final : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr gui_direction_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr viewer_direction_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

@@ -31,3 +31,4 @@ def test_xy_only_controller():
     assert "direction.vector.z = 0.0" in text
     assert "depth" not in text.lower()
     assert '"/homing/direction"' in text
+    assert '"/pinger_homing/direction_body"' in text
