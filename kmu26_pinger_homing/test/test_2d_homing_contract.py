@@ -22,6 +22,7 @@ def test_frequency_selection_contract():
     assert "monitor_s_" in selector
     assert "values.size() > 5U" in selector
     assert "frequency candidates" in selector
+    assert '"/pinger_homing/manual_selection"' in selector
 
 
 def test_xy_only_controller():
@@ -29,3 +30,4 @@ def test_xy_only_controller():
     assert "direction_world_->y()" in text
     assert "direction.vector.z = 0.0" in text
     assert "depth" not in text.lower()
+    assert '"/homing/direction"' in text

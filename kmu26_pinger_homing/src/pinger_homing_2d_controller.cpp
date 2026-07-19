@@ -25,7 +25,7 @@ class FingerHomingController final : public rclcpp::Node {
  public:
   FingerHomingController() : Node("pinger_homing_2d_controller") {
     mode_ = declare_parameter<std::string>("mode", "ALT_HOLD");
-    if (mode_ != "ALT_HOLD") throw std::invalid_argument("finger homing requires ALT_HOLD");
+    if (mode_ != "ALT_HOLD") throw std::invalid_argument("pinger homing requires ALT_HOLD");
     estimator_mode_ = declare_parameter<std::string>("estimator_mode", "phase");
     if (estimator_mode_ != "phase" && estimator_mode_ != "snr") {
       throw std::invalid_argument("estimator_mode must be phase or snr");
@@ -61,6 +61,8 @@ class FingerHomingController final : public rclcpp::Node {
     status_pub_ = create_publisher<std_msgs::msg::String>("/pinger_homing/status", 10);
     direction_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
         "/pinger_homing/direction", 10);
+    gui_direction_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
+        "/homing/direction", 10);
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         odom_topic_, rclcpp::SensorDataQoS(),
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) { on_odom(*msg); });
@@ -137,7 +139,7 @@ class FingerHomingController final : public rclcpp::Node {
   void transition(State next) {
     state_ = next; state_started_ = Clock::now();
     if (next == State::PROBE) { obs_.clear(); snr_obs_.clear(); cumulative_range_ = 0.0; }
-    RCLCPP_INFO(get_logger(), "finger homing state -> %s", state_name(next).c_str());
+    RCLCPP_INFO(get_logger(), "pinger homing state -> %s", state_name(next).c_str());
   }
   static std::string state_name(State state) {
     switch (state) {
@@ -307,6 +309,19 @@ class FingerHomingController final : public rclcpp::Node {
       direction.header.stamp = now(); direction.header.frame_id = "odom";
       direction.vector.x = direction_world_->x(); direction.vector.y = direction_world_->y(); direction.vector.z = 0.0;
       direction_pub_->publish(direction);
+
+      // The UUV Control GUI displays /homing/direction as a base_link FLU
+      // vector.  Keep /pinger_homing/direction in odom for the controller
+      // contract and publish this explicit visualization alias as well.
+      geometry_msgs::msg::Vector3Stamped gui_direction;
+      gui_direction.header.stamp = direction.header.stamp;
+      gui_direction.header.frame_id = "base_link";
+      gui_direction.vector.x = std::cos(yaw_) * direction_world_->x() +
+                               std::sin(yaw_) * direction_world_->y();
+      gui_direction.vector.y = -std::sin(yaw_) * direction_world_->x() +
+                               std::cos(yaw_) * direction_world_->y();
+      gui_direction.vector.z = 0.0;
+      gui_direction_pub_->publish(gui_direction);
     }
   }
 
@@ -330,6 +345,7 @@ class FingerHomingController final : public rclcpp::Node {
   rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr gui_direction_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

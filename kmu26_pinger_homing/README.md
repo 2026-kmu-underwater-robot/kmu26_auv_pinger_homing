@@ -55,11 +55,13 @@ GUI와 launch는 자동 아밍하지 않는다. odometry, audio, MAVROS state가
 별도 finger 패키지는 사용하지 않는다.
 
 ```bash
-ros2 launch kmu26_pinger_homing pinger_homing_test_tank.launch.py \
+ros2 run kmu26_pinger_homing start_pinger_homing_test_tank.sh \
   mode:=ALT_HOLD estimator_mode:=phase \
   auto_select_top:=false dry_run:=false
 ```
 
-5초 감시 뒤 터미널에 표시된 후보 번호 또는 Hz를 입력한다. SNR 모드는
+이 wrapper는 5초 감시가 끝난 뒤 같은 터미널에서 후보 번호 또는 Hz를 받는다.
+`ros2 launch`에 직접 입력한 표준입력은 ROS launch 자식 노드로 전달되지 않으므로,
+수동 선택에는 위 wrapper를 사용한다. SNR 모드는
 `estimator_mode:=snr`로 선택한다. test-tank에서 최종 RC까지 연결할 때만
 `rc_output_topic:=/mavros/rc/override`를 명시한다.

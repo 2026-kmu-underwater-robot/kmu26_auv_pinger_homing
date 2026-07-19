@@ -63,13 +63,13 @@ ros2 run kmu26_pinger_homing start_pinger_homing_gui.sh
 ## test-tank Phase/SNR 핑거 호밍
 
 ```bash
-ros2 launch kmu26_pinger_homing pinger_homing_test_tank.launch.py \
+ros2 run kmu26_pinger_homing start_pinger_homing_test_tank.sh \
   mode:=ALT_HOLD estimator_mode:=phase \
   rc_output_topic:=/mavros/rc/override \
   auto_select_top:=false dry_run:=false
 ```
 
-시작 후 5초 동안 주파수를 스캔해 후보를 최대 5개 표시한다. 터미널에 후보 번호
+시작 후 5초 동안 주파수를 스캔해 후보를 최대 5개 표시한다. 같은 터미널에 후보 번호
 (`1`~`5`) 또는 주파수(Hz)를 입력하면 2-D probe, yaw 정렬, 전진 호밍이 시작된다.
 `estimator_mode:=snr`로 SNR 모드를 선택할 수 있다. 다른 RC 소유권을 보존하려면
 `rc_output_topic`을 기본 `/control/pinger/rc_override`로 둔다.

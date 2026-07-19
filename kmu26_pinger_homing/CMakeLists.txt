@@ -84,6 +84,7 @@ install(PROGRAMS
   src/pinger_homing/single_hydrophone_homing_controller.py
   scripts/pinger_web_gui
   scripts/start_pinger_homing_gui.sh
+  scripts/start_pinger_homing_test_tank.sh
   scripts/install_pinger_homing_gui_launcher.sh
   DESTINATION lib/${PROJECT_NAME})
 

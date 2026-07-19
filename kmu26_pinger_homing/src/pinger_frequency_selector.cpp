@@ -28,6 +28,8 @@ class FingerFrequencySelector final : public rclcpp::Node {
         "selected_frequency_topic", "/pinger_homing/selected_frequency_hz");
     candidate_topic_ = declare_parameter<std::string>(
         "candidate_topic", "/pinger_homing/frequency_candidates");
+    manual_selection_topic_ = declare_parameter<std::string>(
+        "manual_selection_topic", "/pinger_homing/manual_selection");
     sample_rate_ = declare_parameter<int>("sample_rate", 96000);
     channels_ = std::max(1, static_cast<int>(declare_parameter<int>("channels", 2)));
     channel_index_ = std::clamp(static_cast<int>(declare_parameter<int>("channel_index", 0)), 0, channels_ - 1);
@@ -45,6 +47,9 @@ class FingerFrequencySelector final : public rclcpp::Node {
     audio_sub_ = create_subscription<audio_common_msgs::msg::AudioData>(
         audio_topic_, rclcpp::SensorDataQoS(),
         [this](const audio_common_msgs::msg::AudioData::SharedPtr msg) { on_audio(*msg); });
+    manual_selection_sub_ = create_subscription<std_msgs::msg::String>(
+        manual_selection_topic_, 10,
+        [this](const std_msgs::msg::String::SharedPtr msg) { select_from_text(msg->data); });
     timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() { poll_selection(); });
     started_ = std::chrono::steady_clock::now();
     RCLCPP_INFO(get_logger(), "monitoring %.0f--%.0f Hz for %.1f seconds",
@@ -159,6 +164,22 @@ class FingerFrequencySelector final : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "frequency %.1f Hz selected; homing controller may start", frequency);
   }
 
+  void select_from_text(const std::string &text) {
+    if (!monitor_finished_ || selected_) return;
+    const auto values = ranked();
+    try {
+      const double value = std::stod(text);
+      if (value >= 1.0 && value <= static_cast<double>(values.size()) &&
+          std::floor(value) == value) {
+        select(values[static_cast<std::size_t>(value) - 1U].frequency);
+      } else {
+        select(value);
+      }
+    } catch (...) {
+      RCLCPP_WARN(get_logger(), "enter candidate number 1-%zu or frequency in Hz", values.size());
+    }
+  }
+
   void poll_selection() {
     if (!monitor_finished_ && std::chrono::duration<double>(Clock::now() - started_).count() >= monitor_s_) {
       finish_monitor();
@@ -169,16 +190,10 @@ class FingerFrequencySelector final : public rclcpp::Node {
     std::string line;
     std::getline(std::cin, line);
     if (line.empty()) return;
-    const auto values = ranked();
-    try {
-      const double value = std::stod(line);
-      if (value >= 1.0 && value <= static_cast<double>(values.size()) &&
-          std::floor(value) == value) select(values[static_cast<std::size_t>(value) - 1U].frequency);
-      else select(value);
-    } catch (...) { RCLCPP_WARN(get_logger(), "enter candidate number 1-%zu or frequency in Hz", values.size()); }
+    select_from_text(line);
   }
 
-  std::string audio_topic_, selected_topic_, candidate_topic_;
+  std::string audio_topic_, selected_topic_, candidate_topic_, manual_selection_topic_;
   int sample_rate_{96000}, channels_{2}, channel_index_{0}, window_size_{4096}, hop_size_{4096};
   double monitor_s_{5.0}, min_frequency_{15000.0}, max_frequency_{25000.0}, frequency_step_{100.0};
   bool auto_select_top_{false}, monitor_finished_{false}, selected_{false};
@@ -187,6 +202,7 @@ class FingerFrequencySelector final : public rclcpp::Node {
   std::map<double, Candidate> candidates_;
   Clock::time_point started_;
   rclcpp::Subscription<audio_common_msgs::msg::AudioData>::SharedPtr audio_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr manual_selection_sub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr selected_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr candidate_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
