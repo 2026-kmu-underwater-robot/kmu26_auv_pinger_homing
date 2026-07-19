@@ -35,7 +35,9 @@ NUC의 최종 소스 경계는 다음과 같다.
 mkdir -p ~/auv_ws/src
 cd ~/auv_ws/src
 git clone --branch main https://github.com/2026-kmu-underwater-robot/kmu26_auv_pinger_homing.git kmu26_pinger_homing
+cd ~/auv_ws
 vcs import src < src/kmu26_pinger_homing/hydrophone.repos
+cd ~/auv_ws/src
 git clone https://github.com/2026-kmu-underwater-robot/kmu26_auv.git
 cd ~/auv_ws
 rosdep install --from-paths src --ignore-src -r -y
@@ -55,9 +57,12 @@ source install/setup.bash
 ## 실물 핑거 호밍 실행
 
 `pinger_homing_real_interactive.launch.py`가 실물의 표준 진입점이다.
-기존 `kmu26_auv_hydrophone`의 `/audio`를 5초간 FFT 스캔하고, 터미널에서
-후보 번호 또는 정확한 주파수를 선택하면 **C++ Phase ABBA 제어기와 RC mux**를
+기존 `kmu26_auv_hydrophone`의 `/audio`를 10초간 19--22 kHz FFT 스캔하고, 터미널에서
+후보 번호 또는 정확한 주파수를 선택하면 **C++ Phase 제어기**를
 시작한다. 하이드로폰 신호처리 알고리즘 자체는 이 저장소에서 수정하지 않는다.
+실물 기본값은 신뢰 가능한 `/odometry/filtered` 좌표와 검증된 레거시 probe 궤적으로
+핑거 위치를 robust fitting한다. 제어기가 `/mavros/rc/override`를 직접 단독 발행하므로
+이 launch와 동시에 다른 RC publisher를 실행하지 않는다.
 
 ### 시작 전 확인
 
@@ -72,7 +77,8 @@ source install/setup.bash
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/auv_ws/install/setup.bash
+# 실제로 빌드한 작업공간을 source한다. 예: ~/auv_ws 또는 ~/catkin_ws
+source ~/catkin_ws/install/setup.bash
 
 ros2 topic echo /mavros/state --once
 ros2 topic hz /audio
@@ -91,15 +97,15 @@ ros2 launch kmu26_pinger_homing pinger_homing_real_interactive.launch.py \
   tank_max_depth_m:=2.0
 ```
 
-5초 후 출력되는 후보에서 `1`~`5` 또는 주파수 Hz를 입력한다. `qualified` 후보를
+10초 후 출력되는 후보에서 `1`~`5` 또는 주파수 Hz를 입력한다. `qualified` 후보를
 우선 선택한다. dry-run에서는 주파수 선택, Phase 추정, ABBA 상태 변화만 확인하며
 RC 출력은 neutral이다.
 
 ### 2. 실물 저속 호밍
 
 MAVROS가 `connected=true`, `armed=true`, `mode=ALT_HOLD`임을 확인한 뒤 같은
-명령에서 `dry_run:=false`만 바꾼다. 시작 직후 RC mux가
-`/mavros/rc/override`의 pinger 소유권을 갖는다.
+명령에서 `dry_run:=false`만 바꾼다. 시작 직후 C++ 제어기가
+`/mavros/rc/override`를 직접 발행한다.
 
 ```bash
 ros2 launch kmu26_pinger_homing pinger_homing_real_interactive.launch.py \
@@ -120,9 +126,14 @@ ros2 launch kmu26_pinger_homing pinger_homing_real_interactive.launch.py \
 | 오디오 | `audio_topic` | `/audio` | 하이드로폰 PCM 입력 |
 |  | `audio_sample_rate` / `audio_channels` / `audio_sample_format` | `96000` / `2` / `S32LE` | 실제 캡처 형식과 반드시 일치해야 함 |
 |  | `use_audio_capture` | `false` | 이미 팀 하이드로폰 스택이 `/audio`를 내보내면 유지 |
-| FFT 선택 | `scan_monitor_s` | `5.0 s` | 후보를 누적 관측하는 시간 |
+| FFT 선택 | `scan_monitor_s` | `10.0 s` | 후보를 누적 관측하는 시간 |
+|  | `scan_min_frequency_hz` / `scan_max_frequency_hz` | `19000` / `22000 Hz` | 21 kHz 핑거 주변만 탐색 |
+|  | `scan_combine_channels` | `true` | 채널별 noise floor 정규화 후 전력을 합산; 위상 상쇄 방지 |
 |  | `scan_fft_size` / `scan_fft_hop_size` | `16384` / `8192` | 96 kHz에서 5.859 Hz bin, 50% overlap |
 |  | `scan_min_snr_db` / `scan_min_peak_prominence_db` | `9.0` / `4.5 dB` | 자동 선택 가능 후보의 SNR·고립 피크 기준 |
+|  | `scan_persistent_min_ratio` | `0.30` | 약한 신호도 10초 창의 30% 이상 같은 주파수면 후보 인정 |
+| 위치 | `navigation_mode` | `odometry` | `/odometry/filtered` 위치와 Phase 거리변화로 source fitting |
+|  | `odometry_topic` | `/odometry/filtered` | 실물 로컬라이제이션 pose/twist 입력 |
 | 차량 계약 | `mode` | `ALT_HOLD` | live RC를 허용하는 ArduSub 모드 |
 |  | `rate_hz` | `30 Hz` | yaw/상태 제어 주기 |
 |  | `auto_arm` / `auto_mode` | `false` / `false` | 실물에서 임의 arm·모드변경 방지 |
@@ -130,13 +141,14 @@ ros2 launch kmu26_pinger_homing pinger_homing_real_interactive.launch.py \
 | RC | `rc_pwm_span` | `400` | 정규화 명령 1.0에 대응하는 neutral 기준 PWM 폭 |
 |  | `probe_pwm_delta` | `±20` | 1500 기준 ABBA 전·후·좌·우 probe PWM |
 |  | `approach_pwm_delta` | `+25` | 추정 방향 정렬 후 전진 PWM |
-| ABBA | `probe_leg_s` / `probe_neutral_s` | `1.50 s` / `0.50 s` | 각 자극 leg와 neutral 간격 |
-|  | `probe_settle_s` / `probe_sample_delay_s` | `0.80 s` / `0.45 s` | 시작 안정화와 spool-up 제외 시간 |
-|  | `initial_confirmation_probes` | `2` | 첫 방향을 확정하기 전 반복 ABBA 횟수 |
-| 적응 재추정 | `reestimate_policy` | `adaptive` | 고정 시간 대신 신호·운동 피드백으로 ABBA 재실행 |
+| odom 레거시 probe | `legacy_probe_duration_scale` | `1.0` | 성공한 Python 전·후·좌·우·수직 중립분리 궤적의 시간 배율 |
+| no-odom fallback | `probe_leg_s` / `probe_neutral_s` | `1.50 s` / `0.50 s` | `navigation_mode:=no_odom_phase`에서만 사용하는 각 자극 leg/중립 간격 |
+|  | `probe_settle_s` / `probe_sample_delay_s` | `0.80 s` / `0.45 s` | no-odom 시작 안정화와 spool-up 제외 시간 |
+|  | `initial_confirmation_probes` | `2` | no-odom 첫 방향 확정 전 반복 횟수 |
+| no-odom 적응 | `reestimate_policy` | `adaptive` | 신호·운동 피드백으로 no-odom ABBA 재실행 |
 |  | `approach_min_s` / `approach_max_s` | `2.5 s` / `25 s` | innovation 평가 시작 시점 / stale-bearing watchdog |
 |  | `innovation_window_s` / `innovation_limit` / `innovation_hold_s` | `0.70 s` / `1.50` / `1.20 s` | 관측 Phase 중앙값 창 / 정규화 오차 한계 / 지속 시간 |
-| 운동 피드백 | `motion_response_min_speed_mps` | `0.03 m/s` | 이보다 느리면 접촉·벽 정체로 보고 재추정 |
+| no-odom 운동 피드백 | `motion_response_min_speed_mps` | `0.03 m/s` | 이보다 느리면 접촉·벽 정체로 보고 재추정 |
 |  | `motion_response_probe_extension_s` / `motion_response_probe_max_extension_s` | `0.30 s` / `1.20 s` | 느린 probe leg의 추가 시간 / 최대 추가 시간 |
 
 `innovation_ratio`는 퍼센트가 아니라 **정규화된 Phase 잔차**다. ABBA가 예측한
@@ -150,15 +162,18 @@ ros2 launch kmu26_pinger_homing pinger_homing_real_interactive.launch.py \
 ros2 topic echo /pinger_homing/status
 ```
 
-`no_odom_phase.innovation_ratio`, `expected_delta_m`, `observed_delta_m`,
-`innovation_reestimate_count`, `motion_response`를 보면 재추정 원인을 확인할 수 있다.
+기본 odometry 모드에서는 `odometry_fresh`, `sample_count`,
+`estimated_source_world`, `source_locked`, `rms_residual_m`를 확인한다.
+로컬라이제이션을 쓸 수 없는 비상 비교 운용에서만
+`navigation_mode:=no_odom_phase`를 주며, 그때는 `no_odom_phase.innovation_ratio`,
+`innovation_reestimate_count`, `motion_response`를 본다.
 
 ### 튜닝 원칙
 
-- 첫 실물 운용은 `probe_pwm_delta:=20`, `approach_pwm_delta:=25`를 유지한다.
-  추진력이 너무 약하면 PWM을 먼저 올리지 말고 `motion_response_probe_max_extension_s`를
-  늘려 실제 움직임이 관측되는지 확인한다.
-- 전진 중 실제로 멀어지는데 재추정이 늦으면 `innovation_limit`을 낮추거나
+- 첫 실물 odometry 운용은 `probe_pwm_delta:=20`, `approach_pwm_delta:=25`를 유지한다.
+  `/odometry/filtered`에서 실제 변위와 `sample_count` 증가를 확인한 뒤에만 PWM을 조금씩 올린다.
+- 아래 `motion_response`/`innovation` 튜닝은 `navigation_mode:=no_odom_phase` 전용이다.
+  전진 중 실제로 멀어지는데 재추정이 늦으면 `innovation_limit`을 낮추거나
   `innovation_hold_s`를 줄인다. 잡음으로 너무 자주 재추정하면 반대로 올린다.
 - `reestimate_policy:=fixed approach_duration_s:=...`는 과거 고정 주기 비교용이며,
   실물 기본 운용에서는 사용하지 않는다.
@@ -179,10 +194,9 @@ ros2 run kmu26_pinger_homing start_pinger_homing_test_tank.sh \
   auto_select_top:=false dry_run:=false
 ```
 
-시작 후 5초 동안 주파수를 스캔해 후보를 최대 5개 표시한다. 같은 터미널에 후보 번호
+시작 후 10초 동안 19--22 kHz를 스캔해 후보를 최대 5개 표시한다. 같은 터미널에 후보 번호
 (`1`~`5`) 또는 주파수(Hz)를 입력하면 2-D probe, yaw 정렬, 전진 호밍이 시작된다.
-`estimator_mode:=snr`로 SNR 모드를 선택할 수 있다. 다른 RC 소유권을 보존하려면
-`rc_output_topic`을 기본 `/control/pinger/rc_override`로 둔다.
+`estimator_mode:=snr`로 SNR 모드를 선택할 수 있다.
 
 비전 미션 FSM을 다시 사용할 때는 `archive/kmu26_vision_mission_fsm`을 별도 ROS
 작업공간으로 옮겨 독립적으로 빌드한다.

@@ -260,7 +260,7 @@ class PingerHomingController : public rclcpp::Node {
         declare_parameter<double>("align_exit_deg", fast_motion_profile ? 14.0 : 10.0),
         2.0, 20.0));
     align_exit_rad_ = std::min(align_exit_rad_, align_enter_rad_ - radians(2.0));
-    probe_scale_ = clamp(declare_parameter<double>("probe_scale", 0.28), 0.08, 0.30);
+    probe_scale_ = clamp(declare_parameter<double>("probe_scale", 0.28), 0.02, 0.30);
     odometry_timeout_s_ = std::max(
         0.2, declare_parameter<double>("odometry_timeout_s", 2.0));
     imu_timeout_s_ = std::max(
@@ -597,12 +597,26 @@ class PingerHomingController : public rclcpp::Node {
     }
 
     rc_pwm_span_ = clamp(declare_parameter<double>("rc_pwm_span", 400.0), 50.0, 700.0);
+    const int probe_pwm_override = declare_parameter<int>("probe_pwm_delta", 0);
+    const int approach_pwm_override = declare_parameter<int>("approach_pwm_delta", 0);
     const int no_odom_probe_pwm_override = declare_parameter<int>(
         "no_odom_probe_pwm_delta", 0);
     const int no_odom_approach_pwm_override = declare_parameter<int>(
         "no_odom_approach_pwm_delta", 0);
     const int no_odom_terminal_brake_pwm_override = declare_parameter<int>(
         "no_odom_terminal_brake_pwm_delta", 0);
+    // The physical launch exposes PWM deltas, not normalized commands. Apply
+    // them to the odometry/legacy path as well as to the no-odometry fallback;
+    // previously a displayed 20/25 profile silently drove 112/192 PWM in the
+    // odometry controller through its old 0.28/0.48 defaults.
+    if (probe_pwm_override > 0) {
+      probe_scale_ = clamp(
+          static_cast<double>(probe_pwm_override) / rc_pwm_span_, 0.02, 0.30);
+    }
+    if (approach_pwm_override > 0) {
+      forward_max_ = clamp(
+          static_cast<double>(approach_pwm_override) / rc_pwm_span_, 0.03, 0.80);
+    }
     if (no_odom_probe_pwm_override > 0) {
       no_odom_probe_scale_ = no_odom_probe_scale_from_pwm_override(
           no_odom_probe_pwm_override, rc_pwm_span_, no_odom_probe_scale_);
@@ -3008,6 +3022,11 @@ class PingerHomingController : public rclcpp::Node {
         << ",\"sample_count\":" << samples_.size()
         << ",\"probe_attempt\":" << probe_attempt_
         << ",\"minimum_probe_legs\":" << minimum_probe_legs_
+        << ",\"legacy_probe_pwm_delta\":"
+        << static_cast<int>(std::lround(probe_scale_ * rc_pwm_span_))
+        << ",\"legacy_approach_pwm_delta\":"
+        << static_cast<int>(std::lround(forward_max_ * rc_pwm_span_))
+        << ",\"legacy_probe_duration_scale\":" << probe_duration_scale_
         << ",\"probe_completed\":" << bool_text(probe_completed_)
         << ",\"require_source_lock\":" << bool_text(require_source_lock_)
         << ",\"prefer_direction_control\":" << bool_text(prefer_direction_control_)

@@ -16,7 +16,7 @@ trap cleanup EXIT INT TERM
 setsid ros2 launch kmu26_pinger_homing pinger_homing_test_tank.launch.py "$@" auto_select_top:=false &
 launch_pid=$!
 
-echo "[pinger] Waiting for the five-second frequency scan..."
+echo "[pinger] Waiting for the ten-second frequency scan..."
 wait_for_candidate_topic() {
   local deadline=$((SECONDS + 30))
   while (( SECONDS < deadline )); do
@@ -30,7 +30,7 @@ wait_for_candidate_topic() {
 
 # `ros2 topic echo` exits immediately when its target has not yet been
 # advertised.  The selector is launched in parallel, so wait for discovery
-# first; only then wait for the five-second scan result.
+# first; only then wait for the ten-second scan result.
 if ! wait_for_candidate_topic; then
   echo "[pinger] Frequency selector did not advertise its candidate topic within 30 seconds." >&2
   exit 1

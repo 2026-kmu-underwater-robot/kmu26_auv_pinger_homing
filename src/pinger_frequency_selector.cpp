@@ -44,9 +44,10 @@ class FingerFrequencySelector final : public rclcpp::Node {
     channels_ = std::max(1, static_cast<int>(declare_parameter<int>("channels", 2)));
     channel_index_ = std::clamp(
         static_cast<int>(declare_parameter<int>("channel_index", 0)), 0, channels_ - 1);
-    monitor_s_ = std::clamp(declare_parameter<double>("monitor_s", 5.0), 1.0, 30.0);
-    min_frequency_ = declare_parameter<double>("min_frequency_hz", 15000.0);
-    max_frequency_ = declare_parameter<double>("max_frequency_hz", 25000.0);
+    combine_channels_ = declare_parameter<bool>("combine_channels", true);
+    monitor_s_ = std::clamp(declare_parameter<double>("monitor_s", 10.0), 1.0, 30.0);
+    min_frequency_ = declare_parameter<double>("min_frequency_hz", 19000.0);
+    max_frequency_ = declare_parameter<double>("max_frequency_hz", 22000.0);
     if (max_frequency_ <= min_frequency_) {
       throw std::runtime_error("max_frequency_hz must be greater than min_frequency_hz");
     }
@@ -67,6 +68,19 @@ class FingerFrequencySelector final : public rclcpp::Node {
         declare_parameter<double>("min_peak_prominence_db", 4.5), 0.0, 80.0);
     minimum_candidate_hits_ = std::max(
         1, static_cast<int>(declare_parameter<int>("minimum_candidate_hits", 4)));
+    tracking_min_snr_db_ = std::clamp(
+        declare_parameter<double>("tracking_min_snr_db", 0.5), 0.0, 30.0);
+    tracking_min_prominence_db_ = std::clamp(
+        declare_parameter<double>("tracking_min_prominence_db", 0.25), 0.0, 30.0);
+    persistent_min_ratio_ = std::clamp(
+        declare_parameter<double>("persistent_min_ratio", 0.30), 0.01, 1.0);
+    persistent_min_snr_db_ = std::clamp(
+        declare_parameter<double>("persistent_min_snr_db", 1.0), 0.0, 30.0);
+    persistent_min_prominence_db_ = std::clamp(
+        declare_parameter<double>("persistent_min_prominence_db", 0.5), 0.0, 30.0);
+    max_tracked_peaks_per_window_ = std::clamp(
+        static_cast<int>(declare_parameter<int>("max_tracked_peaks_per_window", 12)),
+        1, 50);
     candidate_cluster_hz_ = std::clamp(
         declare_parameter<double>("candidate_cluster_hz", 25.0), 1.0, 500.0);
     candidate_separation_hz_ = std::clamp(
@@ -93,12 +107,15 @@ class FingerFrequencySelector final : public rclcpp::Node {
         manual_selection_topic_, 10,
         [this](const std_msgs::msg::String::SharedPtr msg) { select_from_text(msg->data); });
     timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() { poll_selection(); });
+    channel_samples_.resize(static_cast<std::size_t>(channels_));
     started_ = Clock::now();
     RCLCPP_INFO(
         get_logger(),
-        "FFT scan %.0f--%.0f Hz for %.1fs: N=%d, bin=%.3f Hz, hop=%d, min SNR=%.1f dB",
+        "FFT scan %.0f--%.0f Hz for %.1fs: N=%d, bin=%.3f Hz, hop=%d, "
+        "channels=%d mode=%s min SNR=%.1f dB",
         min_frequency_, max_frequency_, monitor_s_, fft_size_, frequency_resolution_hz(),
-        fft_hop_size_, min_snr_db_);
+        fft_hop_size_, channels_, combine_channels_ ? "normalized-power-sum" : "single",
+        min_snr_db_);
   }
 
  private:
@@ -123,6 +140,7 @@ class FingerFrequencySelector final : public rclcpp::Node {
     double score{0.0};  // average-spectrum SNR in dB
     double prominence_db{0.0};
     int hits{0};
+    double persistence_ratio{0.0};
     bool qualified{false};
   };
 
@@ -232,19 +250,30 @@ class FingerFrequencySelector final : public rclcpp::Node {
   void on_audio(const audio_common_msgs::msg::AudioData &msg) {
     const std::size_t frame_bytes = static_cast<std::size_t>(channels_) * 4U;
     for (std::size_t frame = 0; frame + frame_bytes <= msg.data.size(); frame += frame_bytes) {
-      const std::size_t offset = frame + static_cast<std::size_t>(channel_index_) * 4U;
-      samples_.push_back(static_cast<double>(read_s32(msg.data, offset)) / 2147483648.0);
+      for (int channel = 0; channel < channels_; ++channel) {
+        const std::size_t offset = frame + static_cast<std::size_t>(channel) * 4U;
+        channel_samples_[static_cast<std::size_t>(channel)].push_back(
+            static_cast<double>(read_s32(msg.data, offset)) / 2147483648.0);
+      }
     }
-    while (!monitor_finished_ && samples_.size() >= static_cast<std::size_t>(fft_size_)) {
-      std::vector<double> window(
-          samples_.begin(), samples_.begin() + static_cast<std::ptrdiff_t>(fft_size_));
-      analyze(std::move(window));
-      const std::size_t remove = std::min<std::size_t>(fft_hop_size_, samples_.size());
-      samples_.erase(samples_.begin(), samples_.begin() + static_cast<std::ptrdiff_t>(remove));
+    while (!monitor_finished_ && channels_have_window()) {
+      analyze_channels();
+      for (auto &samples : channel_samples_) {
+        const std::size_t remove = std::min<std::size_t>(fft_hop_size_, samples.size());
+        samples.erase(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(remove));
+      }
     }
   }
 
-  void analyze(std::vector<double> window) {
+  bool channels_have_window() const {
+    if (channel_samples_.empty()) return false;
+    return std::all_of(
+        channel_samples_.begin(), channel_samples_.end(), [this](const auto &samples) {
+          return samples.size() >= static_cast<std::size_t>(fft_size_);
+        });
+  }
+
+  std::vector<double> channel_power(std::vector<double> window) {
     const double mean = std::accumulate(window.begin(), window.end(), 0.0) /
         static_cast<double>(window.size());
     const double denominator = static_cast<double>(std::max(1, fft_size_ - 1));
@@ -256,18 +285,54 @@ class FingerFrequencySelector final : public rclcpp::Node {
     std::vector<std::complex<double>> bins;
     fft_.fwd(bins, window);
     const std::size_t nyquist_bin = bins.size() / 2U;
-    if (average_power_.empty()) average_power_.assign(nyquist_bin + 1U, 0.0);
     std::vector<double> power(nyquist_bin + 1U, 0.0);
     for (std::size_t bin = 0; bin <= nyquist_bin; ++bin) {
       power[bin] = std::norm(bins[bin]);
-      average_power_[bin] += power[bin];
+    }
+    return power;
+  }
+
+  void analyze_channels() {
+    std::vector<double> combined;
+    const int first_channel = combine_channels_ ? 0 : channel_index_;
+    const int final_channel = combine_channels_ ? channels_ : channel_index_ + 1;
+    for (int channel = first_channel; channel < final_channel; ++channel) {
+      const auto &samples = channel_samples_[static_cast<std::size_t>(channel)];
+      std::vector<double> window(
+          samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(fft_size_));
+      std::vector<double> power = channel_power(std::move(window));
+      if (combined.empty()) combined.assign(power.size(), 0.0);
+
+      // Hydrophone channel gains can be very different and their carrier
+      // phases can oppose.  Normalize each channel by its own in-band median
+      // noise floor, then add powers (never PCM amplitudes), so a valid tone
+      // on channel 1 is not hidden by channel 0 or cancelled by phase.
+      const auto [min_bin, max_bin] = band_limits(power.size() - 1U);
+      std::vector<double> band;
+      band.reserve(max_bin - min_bin + 1U);
+      for (std::size_t bin = min_bin; bin <= max_bin; ++bin) band.push_back(power[bin]);
+      const double channel_floor = std::max(1.0e-24, median(std::move(band)));
+      for (std::size_t bin = 0; bin < power.size(); ++bin) {
+        combined[bin] += power[bin] / channel_floor;
+      }
+    }
+    if (average_power_.empty()) average_power_.assign(combined.size(), 0.0);
+    for (std::size_t bin = 0; bin < combined.size(); ++bin) {
+      average_power_[bin] += combined[bin];
     }
     ++fft_windows_;
 
-    // Count independently repeated, qualified window peaks.  The final
-    // ranking uses the entire averaged spectrum; this counter prevents a
-    // single impulse from earning the same confidence as a persistent pinger.
-    for (const auto &peak : spectral_peaks(power, true)) {
+    // Track relaxed per-window peaks separately from final qualification.
+    // A submerged pinger can be only 1--3 dB above a coloured physical noise
+    // floor, but a real carrier remains in the same frequency cluster for a
+    // large fraction of the ten-second scan. Random noise does not.
+    int tracked = 0;
+    for (const auto &peak : spectral_peaks(combined, false)) {
+      if (tracked >= max_tracked_peaks_per_window_) break;
+      if (peak.snr_db < tracking_min_snr_db_ ||
+          peak.prominence_db < tracking_min_prominence_db_) {
+        continue;
+      }
       const double key = std::round(peak.frequency / candidate_cluster_hz_) * candidate_cluster_hz_;
       auto &candidate = repeated_candidates_[key];
       const double weight = std::max(1.0, peak.snr_db);
@@ -275,6 +340,7 @@ class FingerFrequencySelector final : public rclcpp::Node {
       candidate.weight_sum += weight;
       candidate.snr_sum += peak.snr_db;
       ++candidate.hits;
+      ++tracked;
     }
   }
 
@@ -297,13 +363,25 @@ class FingerFrequencySelector final : public rclcpp::Node {
     for (double &power : averaged) power /= static_cast<double>(fft_windows_);
 
     std::vector<Candidate> values;
-    for (const auto &peak : spectral_peaks(averaged, require_quality)) {
+    // Always enumerate averaged peaks with relaxed spectral filtering here;
+    // qualification below can be earned either by the strong instantaneous
+    // thresholds or by ten-second frequency persistence.
+    for (const auto &peak : spectral_peaks(averaged, false)) {
       const int hits = repeated_hits_near(peak.frequency);
-      const bool qualified = peak.snr_db >= min_snr_db_ &&
+      const double persistence_ratio = fft_windows_ > 0U
+          ? std::min(1.0, static_cast<double>(hits) / static_cast<double>(fft_windows_))
+          : 0.0;
+      const bool strong_quality = peak.snr_db >= min_snr_db_ &&
           peak.prominence_db >= min_peak_prominence_db_ &&
           hits >= minimum_candidate_hits_;
+      const bool persistent_quality = peak.snr_db >= persistent_min_snr_db_ &&
+          peak.prominence_db >= persistent_min_prominence_db_ &&
+          hits >= minimum_candidate_hits_ && persistence_ratio >= persistent_min_ratio_;
+      const bool qualified = strong_quality || persistent_quality;
       if (require_quality && !qualified) continue;
-      values.push_back(Candidate{peak.frequency, peak.snr_db, peak.prominence_db, hits, qualified});
+      values.push_back(Candidate{
+          peak.frequency, peak.snr_db, peak.prominence_db, hits,
+          persistence_ratio, qualified});
     }
     std::sort(values.begin(), values.end(), [](const Candidate &a, const Candidate &b) {
       if (a.qualified != b.qualified) return a.qualified;
@@ -335,9 +413,9 @@ class FingerFrequencySelector final : public rclcpp::Node {
       final_candidates_ = ranked(false);
       RCLCPP_WARN(
           get_logger(),
-          "no FFT peak met SNR %.1f dB, prominence %.1f dB and %d repeated windows; "
+          "no FFT peak met strong thresholds or persistent ratio %.0f%%; "
           "showing unqualified spectrum peaks for manual diagnosis",
-          min_snr_db_, min_peak_prominence_db_, minimum_candidate_hits_);
+          100.0 * persistent_min_ratio_);
     }
 
     std::ostringstream json;
@@ -352,6 +430,7 @@ class FingerFrequencySelector final : public rclcpp::Node {
            << ",\"score\":" << candidate.score
            << ",\"snr_db\":" << candidate.score
            << ",\"prominence_db\":" << candidate.prominence_db
+           << ",\"persistence_ratio\":" << candidate.persistence_ratio
            << ",\"qualified\":" << (candidate.qualified ? "true" : "false") << '}';
     }
     json << "]}";
@@ -363,9 +442,11 @@ class FingerFrequencySelector final : public rclcpp::Node {
     for (std::size_t index = 0; index < final_candidates_.size(); ++index) {
       const auto &candidate = final_candidates_[index];
       RCLCPP_INFO(
-          get_logger(), "  [%zu] %.2f Hz (hits=%d, SNR=%.1f dB, prominence=%.1f dB, %s)",
-          index + 1U, candidate.frequency, candidate.hits, candidate.score,
-          candidate.prominence_db, candidate.qualified ? "qualified" : "manual-only");
+          get_logger(), "  [%zu] %.2f Hz (hits=%d, persistence=%.0f%%, "
+          "SNR=%.1f dB, prominence=%.1f dB, %s)",
+          index + 1U, candidate.frequency, candidate.hits,
+          100.0 * candidate.persistence_ratio, candidate.score, candidate.prominence_db,
+          candidate.qualified ? "qualified" : "manual-only");
     }
     if (!auto_select_top_ && stdin_selection_enabled_) {
       RCLCPP_INFO(
@@ -420,14 +501,19 @@ class FingerFrequencySelector final : public rclcpp::Node {
 
   std::string audio_topic_, selected_topic_, candidate_topic_, manual_selection_topic_;
   int sample_rate_{96000}, channels_{2}, channel_index_{0}, fft_size_{8192}, fft_hop_size_{4096};
-  double monitor_s_{5.0}, min_frequency_{15000.0}, max_frequency_{25000.0};
+  bool combine_channels_{true};
+  double monitor_s_{10.0}, min_frequency_{19000.0}, max_frequency_{22000.0};
   double min_snr_db_{9.0}, min_peak_prominence_db_{4.5};
   int minimum_candidate_hits_{4}, max_candidates_{5};
+  double tracking_min_snr_db_{0.5}, tracking_min_prominence_db_{0.25};
+  double persistent_min_ratio_{0.30}, persistent_min_snr_db_{1.0};
+  double persistent_min_prominence_db_{0.5};
+  int max_tracked_peaks_per_window_{12};
   double candidate_cluster_hz_{25.0}, candidate_separation_hz_{75.0};
   double relative_to_top_snr_db_{18.0};
   double blacklist_frequency_hz_{0.0}, blacklist_half_width_hz_{0.0};
   bool auto_select_top_{false}, stdin_selection_enabled_{true}, monitor_finished_{false}, selected_{false};
-  std::deque<double> samples_;
+  std::vector<std::deque<double>> channel_samples_;
   std::vector<double> average_power_;
   std::map<double, AccumulatedCandidate> repeated_candidates_;
   std::vector<Candidate> final_candidates_;

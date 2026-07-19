@@ -32,6 +32,12 @@ def test_frequency_selection_contract():
     assert "relative_to_top_snr_db_" in selector
     assert "average_power_" in selector
     assert "spectral_peaks" in selector
+    assert 'declare_parameter<double>("monitor_s", 10.0)' in selector
+    assert 'declare_parameter<double>("min_frequency_hz", 19000.0)' in selector
+    assert 'declare_parameter<double>("max_frequency_hz", 22000.0)' in selector
+    assert 'declare_parameter<bool>("combine_channels", true)' in selector
+    assert "power[bin] / channel_floor" in selector
+    assert "persistent_min_ratio_" in selector
     assert '"/pinger_homing/manual_selection"' in selector
 
 

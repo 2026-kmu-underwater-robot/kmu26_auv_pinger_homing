@@ -18,14 +18,15 @@ The active controller keeps the tested state order:
 WAIT_VEHICLE -> PROBE <-> REPROBE -> ALIGN <-> APPROACH -> CONTACT -> COMPLETE
 ```
 
-The physical default is `no_odom_phase`: it makes neutral-separated ABBA X/Y
-probe legs, estimates the bearing from Phase range changes, aligns with
-MAVROS IMU yaw, moves forward briefly, then probes again.  It deliberately
-does not feed `/odometry/filtered` or any simulator ground truth into Phase
-control.  ALT_HOLD owns vertical control.
+The physical default is `odometry`: it pairs each Phase range-change sample
+with `/odometry/filtered`, runs the robust moving-sensor source fit from the
+successful legacy controller, locks the fitted source, aligns yaw, and then
+approaches while continuing to update the fit. `no_odom_phase` remains an
+explicit fallback for a vehicle without trustworthy localization. Simulator
+ground truth is never a controller input. ALT_HOLD owns vertical control.
 
-The real and test-tank launches enable `motion_response` as a separate
-timing path. It reads **only the XY speed magnitude** from
+The test-tank profile, and an explicit physical `no_odom_phase` fallback,
+enable `motion_response` as a separate timing path. It reads **only the XY speed magnitude** from
 `/odometry/filtered`, never pose or velocity direction. If a Phase ABBA leg
 has not reached `0.03 m/s`, that same leg is extended in `0.30 s` increments
 (up to `1.20 s`) and produces no Phase sample until it actually moves. If a
@@ -65,6 +66,7 @@ Inputs from the forked hydrophone package:
 
 Vehicle inputs:
 
+- `/odometry/filtered` (`nav_msgs/Odometry`, physical default source-fit input)
 - `/mavros/imu/data` (`sensor_msgs/Imu`)
 - `/mavros/state` (`mavros_msgs/State`)
 - `/depth/pose` (`geometry_msgs/PoseWithCovarianceStamped`, monitored for
@@ -73,7 +75,7 @@ Vehicle inputs:
 
 Outputs:
 
-- `/control/pinger/rc_override` through `rc_override_mux` in the real launch
+- `/mavros/rc/override` directly from the controller in the real launch
 - `/pinger_homing/status`
 - `/pinger_homing/direction_body`
 
@@ -83,7 +85,7 @@ tests as an oracle.
 ## Real-vehicle launch
 
 Start the physical audio stream first.  Then use the interactive launch below instead of
-launching the fixed-frequency real launch directly.  It scans for five seconds, prints up to
+launching the fixed-frequency real launch directly. It scans 19--22 kHz for ten seconds, prints up to
 five candidates, accepts a candidate number or a Hz value in the terminal,
 and starts the untouched `audio_phase_estimator` at that selected frequency.
 

@@ -12,17 +12,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_real_launch_uses_canonical_cpp_no_odom_phase_controller() -> None:
+def test_real_launch_uses_canonical_cpp_odometry_controller() -> None:
     launch = (ROOT / "launch" / "pinger_homing_real.launch.py").read_text()
     assert 'executable="pinger_homing_controller"' in launch
     assert 'executable="single_hydrophone_homing_controller.py"' not in launch
-    assert '"navigation_mode": "no_odom_phase"' in launch
+    assert 'default_value="odometry"' in launch
+    assert '"navigation_mode": LaunchConfiguration("navigation_mode")' in launch
+    assert 'DeclareLaunchArgument("odometry_topic", default_value="/odometry/filtered")' in launch
     assert '"acoustic_estimator_mode": "phase"' in launch
     assert '"no_odom_horizontal_only": True' in launch
     assert '"no_odom_vertical_control_enabled": False' in launch
     assert '"motion_response_enabled"' in launch
     assert '"motion_response_velocity_topic"' in launch
     assert '"motion_response_min_speed_mps"' in launch
+    assert '"probe_pwm_delta": ParameterValue(' in launch
+    assert '"approach_pwm_delta": ParameterValue(' in launch
+    assert '"probe_duration_scale": ParameterValue(' in launch
+    assert '"rc_output_topic": rc_topic' in launch
+    assert 'executable="rc_override_mux"' not in launch
 
 
 def test_real_launch_preserves_external_hydrophone_estimator_boundary() -> None:
@@ -50,7 +57,19 @@ def test_interactive_launch_scans_then_injects_selected_startup_frequency() -> N
     assert 'gui_rc_handoff' in launch
     assert '"scan_fft_size", default_value="16384"' in launch
     assert '"scan_fft_hop_size", default_value="8192"' in launch
+    assert '"scan_monitor_s", default_value="10.0"' in launch
+    assert '"scan_min_frequency_hz", default_value="19000.0"' in launch
+    assert '"scan_max_frequency_hz", default_value="22000.0"' in launch
+    assert '"scan_combine_channels", default_value="true"' in launch
+    assert '"scan_persistent_min_ratio", default_value="0.30"' in launch
     assert "96000/16384 = 5.86 Hz bins" in launch
+    assert "args=[], context=gate_context" in launch
+    assert "SignalHandlerOptions.NO" in launch
+    assert "not context.is_shutdown" in launch
+    assert "SingleThreadedExecutor(context=gate_context)" in launch
+    assert "gate_executor.spin_once" in launch
+    assert "selection_deadline = time.monotonic()" in launch
+    assert '"use_rc_mux"' not in launch
     assert 'gui_rc_handoff_service' in launch
     assert 'gui_rc_restore_service' in launch
     assert 'default_value="/uuv_web_control_gui/suspend_rc_override"' in launch
@@ -89,7 +108,7 @@ def test_adaptive_phase_reestimate_uses_innovation_not_fixed_cadence() -> None:
 
 
 if __name__ == "__main__":
-    test_real_launch_uses_canonical_cpp_no_odom_phase_controller()
+    test_real_launch_uses_canonical_cpp_odometry_controller()
     test_real_launch_preserves_external_hydrophone_estimator_boundary()
     test_xy_alt_hold_does_not_require_depth_for_a_heave_free_probe()
     test_interactive_launch_scans_then_injects_selected_startup_frequency()

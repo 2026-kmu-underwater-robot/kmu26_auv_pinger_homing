@@ -9,16 +9,15 @@
 
 - forked `audio_capture/audio_phase_estimator`
 - canonical C++ Phase/SNR RC controller (`pinger_homing_controller`)
-- moving-sensor source fit and no-odometry ABBA/Huber Phase bearing mode
-- exclusive `/mavros/rc/override` mux
+- `/odometry/filtered` moving-sensor source fit and no-odometry fallback
+- direct, single-owner `/mavros/rc/override` output
 
 실물 토픽 계약:
 
 - 위치: `/odometry/filtered`
 - 차량 상태: `/mavros/state`
 - 최종 RC: `/mavros/rc/override`
-- 핑거 RC mux 입력: `/control/pinger/rc_override`
-- 조이스틱 RC mux 입력: `/control/joystick/rc_override`
+- 핑거 최종 RC: `/mavros/rc/override` (표준 launch에서 직접 발행)
 
 ```bash
 vcs import src < src/kmu26_pinger_homing/hydrophone.repos
@@ -33,17 +32,22 @@ ros2 launch kmu26_pinger_homing pinger_homing_real_interactive.launch.py \
 1. 프로펠러를 제거한 상태에서 interactive launch의 `dry_run:=true`를 먼저 검증한다.
 2. MAVROS에서 ALT_HOLD와 arm 상태를 확인한다.
 3. 토픽과 Phase 추정이 정상일 때만 `dry_run:=false`를 사용한다.
-4. 조이스틱 `/control/joystick/rc_override`는 mux 우선권을 가져간다. launch 종료 또는 DISARM으로 즉시 중단한다.
+4. 실행 중에는 다른 `/mavros/rc/override` publisher를 띄우지 않는다. launch 종료 또는 DISARM으로 즉시 중단한다.
 
-실물 wrapper는 시작 전에 5초 주파수 스캔을 수행하고 후보 1~5 또는 Hz를
+실물 wrapper는 시작 전에 19--22 kHz를 10초 주파수 스캔하고 후보 1~5 또는 Hz를
 같은 터미널에서 받는다. 선택한 주파수로 기존 `audio_phase_estimator`를
-시작한 뒤, 검증된 C++ no-odometry Phase 제어기를 실행한다.
+시작한 뒤, 검증된 C++ Phase 제어기를 실행한다. 기본 `navigation_mode:=odometry`는
+`/odometry/filtered`의 pose와 Phase 거리변화를 레거시 이동 궤적에 결합해 핑거 위치를
+추정한다. `no_odom_phase`는 로컬라이제이션이 없는 경우의 명시적 fallback이다.
 
 실물 interactive launch는 고정 pinger carrier를 더 잘 구분하도록 기본
 `scan_fft_size:=16384`, `scan_fft_hop_size:=8192`를 사용한다. 따라서 96 kHz
-하이드로폰에서는 **5.86 Hz/bin** (48 kHz에서는 2.93 Hz/bin)이며, 5초 스캔에서도
-각각 약 57회/28회의 50% 중첩 FFT 창이 남는다. 수조 시뮬레이터의 generic selector
-기본값 8192는 빠른 반복 시험용으로 그대로 유지된다.
+하이드로폰에서는 **5.86 Hz/bin** (48 kHz에서는 2.93 Hz/bin)이며, 10초 스캔에서는
+각각 약 116회/57회의 50% 중첩 FFT 창이 남는다. 두 오디오 채널은 PCM으로 합치지 않고
+각 채널의 band-median noise floor로 정규화한 FFT power를 합치므로 위상 반전이나
+채널 gain 차이로 21 kHz가 사라지지 않는다. 수조 시뮬레이터의 generic selector
+기본값 8192는 빠른 반복 시험용으로 그대로 유지된다. 강한 단일 창뿐 아니라 같은
+주파수 cluster가 전체 창의 기본 30% 이상 반복되는 약한 carrier도 후보로 인정한다.
 
 C++ launch는 자동 아밍하지 않는다. audio, MAVROS state 또는 IMU가
 stale이거나 disarm/ALT_HOLD 이탈이면 모든 RC 채널을 release한다. 실물 IQ
@@ -64,9 +68,9 @@ ros2 run kmu26_pinger_homing start_pinger_homing_test_tank.sh \
   auto_select_top:=false dry_run:=false
 ```
 
-이 wrapper는 5초 감시가 끝난 뒤 같은 터미널에서 후보 번호 또는 Hz를 받는다.
+이 wrapper는 10초 감시가 끝난 뒤 같은 터미널에서 후보 번호 또는 Hz를 받는다.
 후보는 기존 `kmu26_auv_hydrophone` FFT 노드의 계약을 따라, 8192-sample Hann FFT
-(96 kHz 입력이면 **11.72 Hz/bin**), 50% overlap, 5초 Welch 평균 스펙트럼, band median
+(96 kHz 입력이면 **11.72 Hz/bin**), 50% overlap, 10초 Welch 평균 스펙트럼, band median
 noise-floor SNR, local peak prominence, 그리고 반복 검출 횟수로 판정한다. 따라서 한
 프레임 노이즈나 강한 side-lobe는 후보가 되지 않고, 수조 송신기 21164 Hz도 FFT peak
 interpolation으로 100 Hz 단위로 반올림하지 않는다. 기본 품질 기준은 `SNR >= 9 dB`,

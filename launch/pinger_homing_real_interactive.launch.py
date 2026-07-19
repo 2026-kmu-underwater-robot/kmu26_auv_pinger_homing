@@ -2,7 +2,7 @@
 """Interactive physical Phase-homing entry point.
 
 This is deliberately a *launch* entry point, not a shell wrapper.  It starts
-the C++ five-second frequency scanner on the already available audio stream.
+the C++ ten-second frequency scanner on the already available audio stream.
 The operator enters a displayed candidate number (or a frequency in Hz) in
 the same terminal.  Only then is the untouched external phase estimator
 started, with the selection as its immutable startup frequency, followed by
@@ -43,7 +43,6 @@ from launch_ros.parameter_descriptions import ParameterValue
 _REAL_ARGUMENTS = (
     "dry_run",
     "use_hydrophone_estimator",
-    "use_rc_mux",
     "audio_device",
     "audio_topic",
     "audio_channels",
@@ -51,6 +50,7 @@ _REAL_ARGUMENTS = (
     "audio_sample_format",
     "audio_input_latency_s",
     "use_sim_time",
+    "navigation_mode",
     "odometry_topic",
     "motion_response_enabled",
     "motion_response_velocity_topic",
@@ -69,7 +69,6 @@ _REAL_ARGUMENTS = (
     "direction_topic",
     "status_topic",
     "direction_output_topic",
-    "pinger_rc_topic",
     "rc_topic",
     "rate_hz",
     "mode",
@@ -85,10 +84,10 @@ _REAL_ARGUMENTS = (
     "arrival_hold_s",
     "max_runtime_s",
     "amplitude_range_constant",
-    "rc_mux_stale_timeout",
     "rc_pwm_span",
     "probe_pwm_delta",
     "approach_pwm_delta",
+    "legacy_probe_duration_scale",
     "probe_leg_s",
     "probe_neutral_s",
     "probe_settle_s",
@@ -116,7 +115,7 @@ def _gui_handoff_requested(context) -> bool:
     raise RuntimeError("gui_rc_handoff must be auto, true, or false")
 
 
-def _handoff_gui_rc_if_available(gate, context) -> None:
+def _handoff_gui_rc_if_available(gate, gate_executor, context) -> None:
     """Release the optional simulator GUI publisher before the mux starts."""
     if not _gui_handoff_requested(context):
         return
@@ -133,9 +132,7 @@ def _handoff_gui_rc_if_available(gate, context) -> None:
             f"GUI RC handoff service {service_name} is unavailable; refusing live exclusive RC launch"
         )
     future = client.call_async(Trigger.Request())
-    import rclpy
-
-    rclpy.spin_until_future_complete(gate, future, timeout_sec=3.0)
+    gate_executor.spin_until_future_complete(future, timeout_sec=3.0)
     response = future.result()
     if response is None or not response.success:
         message = response.message if response is not None else "no response"
@@ -149,26 +146,38 @@ def _restore_gui_rc_on_shutdown(context, *args, **kwargs):
     if not _gui_handoff_requested(context):
         return []
     import rclpy
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.signals import SignalHandlerOptions
     from std_srvs.srv import Trigger
 
     # This is intentionally a different service from the launch-time handoff.
     # Reusing ``.../suspend_rc_override`` here stranded the web GUI without an
     # RC publisher after a terminal-launched pinger run exited.
     service_name = LaunchConfiguration("gui_rc_restore_service").perform(context)
-    rclpy.init(args=None)
-    gate = rclpy.create_node("pinger_frequency_launch_restore")
+    gate_context = Context()
+    rclpy.init(
+        args=[], context=gate_context,
+        signal_handler_options=SignalHandlerOptions.NO,
+    )
+    gate = rclpy.create_node("pinger_frequency_launch_restore", context=gate_context)
+    gate_executor = SingleThreadedExecutor(context=gate_context)
+    gate_executor.add_node(gate)
     try:
         client = gate.create_client(Trigger, service_name)
         if not client.wait_for_service(timeout_sec=0.75):
             return []
         future = client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(gate, future, timeout_sec=2.0)
+        gate_executor.spin_until_future_complete(future, timeout_sec=2.0)
         response = future.result()
         if response is not None:
             print(f"[pinger] GUI RC restore: {response.message}")
     finally:
+        gate_executor.remove_node(gate)
+        gate_executor.shutdown()
         gate.destroy_node()
-        rclpy.shutdown()
+        if gate_context.ok():
+            rclpy.shutdown(context=gate_context)
     return []
 
 
@@ -176,7 +185,10 @@ def _start_real_homing_after_selection(context, *args, **kwargs):
     """Wait for the selector's volatile choice then include the real launch."""
     del args, kwargs
     import rclpy
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import DurabilityPolicy, QoSProfile
+    from rclpy.signals import SignalHandlerOptions
     from std_msgs.msg import Float64, String
 
     selected_topic = LaunchConfiguration("selected_frequency_topic").perform(context)
@@ -186,10 +198,16 @@ def _start_real_homing_after_selection(context, *args, **kwargs):
     selected_frequency: list[float] = []
     candidates: list[str] = []
 
-    rclpy.init(args=None)
-    gate = rclpy.create_node("pinger_frequency_launch_gate")
+    gate_context = Context()
+    rclpy.init(
+        args=[], context=gate_context,
+        signal_handler_options=SignalHandlerOptions.NO,
+    )
+    gate = rclpy.create_node("pinger_frequency_launch_gate", context=gate_context)
+    gate_executor = SingleThreadedExecutor(context=gate_context)
+    gate_executor.add_node(gate)
     # The candidate list is transient-local: the gate can reliably receive it
-    # even if terminal output is busy when the five-second scan finishes.
+    # even if terminal output is busy when the ten-second scan finishes.
     candidate_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     gate.create_subscription(String, candidate_topic, lambda message: candidates.append(message.data), candidate_qos)
     gate.create_subscription(
@@ -201,8 +219,15 @@ def _start_real_homing_after_selection(context, *args, **kwargs):
     selection_pub = gate.create_publisher(String, manual_selection_topic, 10)
     deadline = time.monotonic() + max(5.0, timeout_s)
     try:
-        while not candidates and time.monotonic() < deadline and rclpy.ok():
-            rclpy.spin_once(gate, timeout_sec=0.20)
+        while (
+            not candidates
+            and time.monotonic() < deadline
+            and gate_context.ok()
+            and not context.is_shutdown
+        ):
+            gate_executor.spin_once(timeout_sec=0.20)
+        if context.is_shutdown:
+            return []
         if not candidates:
             raise RuntimeError(
                 "No pinger frequency candidates arrived before selection_timeout_s. "
@@ -214,43 +239,69 @@ def _start_real_homing_after_selection(context, *args, **kwargs):
             for index, candidate in enumerate(ranked, start=1):
                 snr_db = float(candidate.get("snr_db", candidate["score"]))
                 prominence_db = float(candidate.get("prominence_db", 0.0))
+                persistence = 100.0 * float(candidate.get("persistence_ratio", 0.0))
                 quality = "qualified" if bool(candidate.get("qualified", True)) else "manual-only"
                 print(
                     "[pinger] "
                     f"[{index}] {float(candidate['frequency_hz']):.1f} Hz "
-                    f"(hits={int(candidate['hits'])}, SNR={snr_db:.1f} dB, "
+                    f"(hits={int(candidate['hits'])}, persistence={persistence:.0f}%, "
+                    f"SNR={snr_db:.1f} dB, "
                     f"prominence={prominence_db:.1f} dB, {quality})"
                 )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             print("[pinger] frequency scan complete; enter a candidate number or exact Hz.")
+        scan_min_hz = float(LaunchConfiguration("scan_min_frequency_hz").perform(context))
+        scan_max_hz = float(LaunchConfiguration("scan_max_frequency_hz").perform(context))
         while True:
             choice = input("[pinger] Enter displayed candidate 1-5 or an exact frequency in Hz: ").strip()
             try:
                 numeric = float(choice)
                 valid_index = numeric.is_integer() and 1 <= int(numeric) <= len(ranked)
-                valid_frequency = 15000.0 <= numeric <= 25000.0
+                valid_frequency = scan_min_hz <= numeric <= scan_max_hz
                 if valid_index or valid_frequency:
                     break
             except ValueError:
                 pass
-            print("[pinger] Enter a displayed candidate number or 15000--25000 Hz.")
+            print(
+                f"[pinger] Enter a displayed candidate number or "
+                f"{scan_min_hz:.0f}--{scan_max_hz:.0f} Hz."
+            )
         selection_pub.publish(String(data=choice))
-        while not selected_frequency and time.monotonic() < deadline and rclpy.ok():
-            rclpy.spin_once(gate, timeout_sec=0.20)
+        # Candidate acquisition and operator response are separate timeout
+        # phases. A slow but valid operator choice must still receive a full
+        # DDS handoff window after Enter is pressed.
+        selection_deadline = time.monotonic() + max(5.0, timeout_s)
+        while (
+            not selected_frequency
+            and time.monotonic() < selection_deadline
+            and gate_context.ok()
+            and not context.is_shutdown
+        ):
+            gate_executor.spin_once(timeout_sec=0.20)
         if selected_frequency:
-            _handoff_gui_rc_if_available(gate, context)
+            _handoff_gui_rc_if_available(gate, gate_executor, context)
     finally:
+        gate_executor.remove_node(gate)
+        gate_executor.shutdown()
         gate.destroy_node()
-        rclpy.shutdown()
+        if gate_context.ok():
+            rclpy.shutdown(context=gate_context)
 
+    if context.is_shutdown:
+        return []
     if not selected_frequency:
         raise RuntimeError(
             "No pinger frequency was selected before selection_timeout_s. "
             "Enter a displayed candidate number in this launch terminal."
         )
     selected_hz = selected_frequency[-1]
-    if not 15000.0 <= selected_hz <= 25000.0:
-        raise RuntimeError(f"Selected frequency {selected_hz:.3f} Hz is outside 15000--25000 Hz")
+    scan_min_hz = float(LaunchConfiguration("scan_min_frequency_hz").perform(context))
+    scan_max_hz = float(LaunchConfiguration("scan_max_frequency_hz").perform(context))
+    if not scan_min_hz <= selected_hz <= scan_max_hz:
+        raise RuntimeError(
+            f"Selected frequency {selected_hz:.3f} Hz is outside "
+            f"{scan_min_hz:.0f}--{scan_max_hz:.0f} Hz"
+        )
 
     launch_arguments = {
         name: LaunchConfiguration(name).perform(context) for name in _REAL_ARGUMENTS
@@ -280,7 +331,6 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("dry_run", default_value="true"),
         DeclareLaunchArgument("use_audio_capture", default_value="false"),
         DeclareLaunchArgument("use_hydrophone_estimator", default_value="true"),
-        DeclareLaunchArgument("use_rc_mux", default_value="true"),
         DeclareLaunchArgument("audio_device", default_value=""),
         DeclareLaunchArgument("audio_topic", default_value="/audio"),
         DeclareLaunchArgument("audio_channels", default_value="2"),
@@ -288,6 +338,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("audio_sample_format", default_value="S32LE"),
         DeclareLaunchArgument("audio_input_latency_s", default_value="0.0"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument("navigation_mode", default_value="odometry"),
         DeclareLaunchArgument("odometry_topic", default_value="/odometry/filtered"),
         DeclareLaunchArgument("motion_response_enabled", default_value="true"),
         DeclareLaunchArgument("motion_response_velocity_topic", default_value="/odometry/filtered"),
@@ -306,7 +357,6 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("direction_topic", default_value="/homing/direction"),
         DeclareLaunchArgument("status_topic", default_value="/pinger_homing/status"),
         DeclareLaunchArgument("direction_output_topic", default_value="/pinger_homing/direction_body"),
-        DeclareLaunchArgument("pinger_rc_topic", default_value="/control/pinger/rc_override"),
         DeclareLaunchArgument("rc_topic", default_value="/mavros/rc/override"),
         DeclareLaunchArgument("rate_hz", default_value="30.0"),
         DeclareLaunchArgument("mode", default_value="ALT_HOLD"),
@@ -322,10 +372,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("arrival_hold_s", default_value="1.0"),
         DeclareLaunchArgument("max_runtime_s", default_value="180.0"),
         DeclareLaunchArgument("amplitude_range_constant", default_value="0.0"),
-        DeclareLaunchArgument("rc_mux_stale_timeout", default_value="0.35"),
         DeclareLaunchArgument("rc_pwm_span", default_value="400.0"),
         DeclareLaunchArgument("probe_pwm_delta", default_value="20"),
         DeclareLaunchArgument("approach_pwm_delta", default_value="25"),
+        DeclareLaunchArgument("legacy_probe_duration_scale", default_value="1.0"),
         DeclareLaunchArgument("probe_leg_s", default_value="1.5"),
         DeclareLaunchArgument("probe_neutral_s", default_value="0.50"),
         DeclareLaunchArgument("probe_settle_s", default_value="0.80"),
@@ -345,7 +395,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("selected_frequency_topic", default_value="/pinger_homing/selected_frequency_hz"),
         DeclareLaunchArgument("candidate_topic", default_value="/pinger_homing/frequency_candidates"),
         DeclareLaunchArgument("manual_selection_topic", default_value="/pinger_homing/manual_selection"),
-        DeclareLaunchArgument("scan_monitor_s", default_value="5.0"),
+        DeclareLaunchArgument("scan_monitor_s", default_value="10.0"),
+        DeclareLaunchArgument("scan_min_frequency_hz", default_value="19000.0"),
+        DeclareLaunchArgument("scan_max_frequency_hz", default_value="22000.0"),
+        DeclareLaunchArgument("scan_combine_channels", default_value="true"),
         DeclareLaunchArgument(
             "scan_fft_size", default_value="16384",
             description=(
@@ -370,6 +423,11 @@ def generate_launch_description() -> LaunchDescription:
             "scan_minimum_candidate_hits", default_value="4",
             description="Minimum independently repeated FFT windows for a qualified candidate.",
         ),
+        DeclareLaunchArgument("scan_tracking_min_snr_db", default_value="0.5"),
+        DeclareLaunchArgument("scan_tracking_min_prominence_db", default_value="0.25"),
+        DeclareLaunchArgument("scan_persistent_min_ratio", default_value="0.30"),
+        DeclareLaunchArgument("scan_persistent_min_snr_db", default_value="1.0"),
+        DeclareLaunchArgument("scan_persistent_min_prominence_db", default_value="0.5"),
         DeclareLaunchArgument(
             "scan_candidate_separation_hz", default_value="75.0",
             description="Do not list sidelobes within this distance of a stronger peak.",
@@ -425,6 +483,15 @@ def generate_launch_description() -> LaunchDescription:
             "channels": ParameterValue(LaunchConfiguration("audio_channels"), value_type=int),
             "sample_rate": ParameterValue(LaunchConfiguration("audio_sample_rate"), value_type=int),
             "monitor_s": ParameterValue(LaunchConfiguration("scan_monitor_s"), value_type=float),
+            "min_frequency_hz": ParameterValue(
+                LaunchConfiguration("scan_min_frequency_hz"), value_type=float
+            ),
+            "max_frequency_hz": ParameterValue(
+                LaunchConfiguration("scan_max_frequency_hz"), value_type=float
+            ),
+            "combine_channels": ParameterValue(
+                LaunchConfiguration("scan_combine_channels"), value_type=bool
+            ),
             "fft_size": ParameterValue(LaunchConfiguration("scan_fft_size"), value_type=int),
             "fft_hop_size": ParameterValue(LaunchConfiguration("scan_fft_hop_size"), value_type=int),
             "min_snr_db": ParameterValue(LaunchConfiguration("scan_min_snr_db"), value_type=float),
@@ -433,6 +500,21 @@ def generate_launch_description() -> LaunchDescription:
             ),
             "minimum_candidate_hits": ParameterValue(
                 LaunchConfiguration("scan_minimum_candidate_hits"), value_type=int
+            ),
+            "tracking_min_snr_db": ParameterValue(
+                LaunchConfiguration("scan_tracking_min_snr_db"), value_type=float
+            ),
+            "tracking_min_prominence_db": ParameterValue(
+                LaunchConfiguration("scan_tracking_min_prominence_db"), value_type=float
+            ),
+            "persistent_min_ratio": ParameterValue(
+                LaunchConfiguration("scan_persistent_min_ratio"), value_type=float
+            ),
+            "persistent_min_snr_db": ParameterValue(
+                LaunchConfiguration("scan_persistent_min_snr_db"), value_type=float
+            ),
+            "persistent_min_prominence_db": ParameterValue(
+                LaunchConfiguration("scan_persistent_min_prominence_db"), value_type=float
             ),
             "candidate_separation_hz": ParameterValue(
                 LaunchConfiguration("scan_candidate_separation_hz"), value_type=float

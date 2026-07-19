@@ -15,10 +15,7 @@
 src/pinger_homing/pinger_homing_controller.cpp
   위 추정 결과 + /odometry/filtered + /mavros/state
     -> 능동 위치 추정 및 접근 RC
-    -> /control/pinger/rc_override
-
-rc_override_mux
-  -> /mavros/rc/override
+    -> /mavros/rc/override (단독 직접 발행)
 ```
 
 하이드로폰 의존성은 저장소 최상위 `hydrophone.repos`에 팀 포크 URL과 검증 커밋
@@ -63,8 +60,8 @@ WAIT_VEHICLE -> PROBE <-> REPROBE -> ALIGN <-> APPROACH -> CONTACT -> COMPLETE
 - dry-run에서는 탐색/추정/요청 명령을 그대로 계산하되 항상 모든 RC 채널 release
 - 상태와 명령을 `/pinger_homing/status` JSON으로 공개
 
-실물 출력은 RC mux 입력 `/control/pinger/rc_override`로 보내며, mux만 최종
-`/mavros/rc/override`를 소유한다.
+실물 표준 launch에서는 별도 mux를 시작하지 않는다. C++ 제어기가 최종
+`/mavros/rc/override`를 직접 소유하며, 실행 중 다른 RC publisher는 정지해야 한다.
 
 이 패키지는 `CollectorState`, YOLO, 부표 포획 상태, MuJoCo ground truth를 구독하지 않는다.
 비전 부표 제어와 미션 FSM은 형제 패키지 `kmu26_vision_mission_fsm`에만 둔다.
@@ -79,8 +76,8 @@ colcon build --packages-select \
 source install/setup.bash
 ```
 
-실물 오디오 스트림을 켠 뒤 핑거 호밍만 실행한다. 아래 wrapper는 먼저 5초 동안
-주파수를 스캔하고 후보 1~5개를 출력한다. 터미널에서 후보 번호(또는 Hz)를 고르면,
+실물 오디오 스트림을 켠 뒤 핑거 호밍만 실행한다. 아래 launch는 먼저 19--22 kHz를
+10초 동안 스캔하고 후보 1~5개를 출력한다. 터미널에서 후보 번호(또는 Hz)를 고르면,
 그 주파수를 원본 phase estimator의 시작 파라미터로 넣은 뒤 canonical C++ 제어기를
 실행한다.
 
@@ -93,7 +90,7 @@ ros2 launch kmu26_pinger_homing pinger_homing_real_interactive.launch.py \
 ```
 
 현장 스캔·선택은 위 interactive launch를 사용한다. 자동 아밍하지 않고, `/mavros/state`가
-armed이며 required mode일 때만 컨트롤러 출력이 mux를 통해 `/mavros/rc/override`로 전달된다. 실물 IQ-거리 보정 전에는
+armed이며 required mode일 때만 컨트롤러가 `/mavros/rc/override`에 유효한 명령을 직접 보낸다. 실물 IQ-거리 보정 전에는
 `amplitude_range_constant:=0.0`, `success_range_m:=0.0`을 유지한다.
 
 Python 구현은 비교/아카이브용으로 남기며, 설치·수조·실물 launch의 제어기는 canonical
